@@ -1,0 +1,18 @@
+# Cache and temporary files
+cache/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+qwvenv/
+
+# Model outputs and checkpoints
+output/
+qwen3-mhc/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
