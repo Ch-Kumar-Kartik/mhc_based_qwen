@@ -16,3 +16,6 @@ qwen3-mhc/
 
 # OS
 .DS_Store
+
+# converted model
+qwen3-0.6b-mhc/
