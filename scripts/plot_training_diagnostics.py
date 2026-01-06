@@ -4,20 +4,28 @@
 Generates the requested graphs:
 1) Absolute training loss gap vs training steps
 2) Gradient norm vs training steps
-3) Single-layer mapping + composite mapping: amax(|mapping|) vs layer index l
+3) Single-layer mapping + composite mapping: Amax Gain Magnitude vs layer index l
+
+For (3), each standard Transformer block is unrolled into two layers on the x-axis:
+Attention then FFN.
+
+The Amax Gain Magnitude (y-axis) is computed per mapping matrix H as:
+        0.5 * (max_abs_row_sum(H) + max_abs_col_sum(H))
+and then averaged over all tokens in a selected sequence.
 
 Inputs:
 - Training logs (standard and mhc) produced by scripts/train.py or scripts/train_amd.py
-  Expected to contain lines like:
-    Step 123: loss=..., lr=..., grad_norm=...
+    Expected to contain lines like:
+        Step 123: loss=..., lr=..., grad_norm=...
 - An mHC checkpoint directory for mapping plots (optional but needed for #3)
 
 Example:
-  python -m scripts.plot_training_diagnostics \
-    --standard-log /path/to/standard/train.log \
-    --mhc-log /path/to/mhc/train.log \
-    --mhc-model /path/to/mhc/checkpoint-1000 \
-    --outdir ./plots
+    python -m scripts.plot_training_diagnostics \
+        --standard-log /path/to/standard/train.log \
+        --mhc-log /path/to/mhc/train.log \
+        --mhc-model /path/to/mhc/checkpoint-1000 \
+        --sequence "Hello world" \
+        --outdir ./plots
 
 If matplotlib is missing, the script will print an install hint.
 """
@@ -28,9 +36,12 @@ import argparse
 import os
 import re
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, TYPE_CHECKING
 
 import numpy as np
+
+if TYPE_CHECKING:
+    import torch
 
 
 _STEP_RE = re.compile(
@@ -92,38 +103,129 @@ def _align_by_step(a: Series, b: Series) -> Tuple[np.ndarray, np.ndarray, np.nda
     return np.asarray(common, dtype=np.int64), a_loss, b_loss
 
 
-def _compute_mhc_mappings(mhc_model_path: str) -> Dict[str, np.ndarray]:
+def _amax_gain_magnitude_from_h_res(h_res: "torch.Tensor") -> "torch.Tensor":
+    """Compute Amax Gain Magnitude per token for H_res.
+
+    Args:
+        h_res: (B, S, n, n) doubly-stochastic mixing matrices.
+
+    Returns:
+        gain: (B, S) tensor.
+    """
+    # Forward signal bound: max absolute row sum
+    max_abs_row_sum = h_res.abs().sum(dim=-1).max(dim=-1).values  # (B, S)
+    # Backward gradient bound: max absolute column sum
+    max_abs_col_sum = h_res.abs().sum(dim=-2).max(dim=-1).values  # (B, S)
+    return 0.5 * (max_abs_row_sum + max_abs_col_sum)
+
+
+def _collect_h_res_per_sublayer(
+    mhc_model: "torch.nn.Module",
+    input_ids: "torch.Tensor",
+    attention_mask: Optional["torch.Tensor"],
+    device: str,
+) -> "torch.Tensor":
+    """Run one forward pass and collect per-token H_res for each Attention/FFN sublayer.
+
+    Returns:
+        h_all: (L2, B, S, n, n) where L2 = 2*num_hidden_layers (attn then ffn).
+    """
+    import torch
+
+    mhc_model.eval()
+
+    # We'll collect H_res in strict execution order: layer0.attn, layer0.ffn, layer1.attn, ...
+    collected: List[torch.Tensor] = []
+    hooks = []
+
+    def _make_pre_hook(layer_name: str):
+        def _pre_hook(module, args, kwargs):
+            # args[0] is x: (B, S, n, C)
+            x = args[0]
+            B, S, n, C = x.shape
+            x_flat = x.view(B, S, n * C)
+            with torch.no_grad():
+                _, _, h_res = module.compute_coefficients(x_flat)
+            collected.append(h_res.detach().to("cpu"))
+        return _pre_hook
+
+    # Register hooks
+    for layer in mhc_model.model.layers:
+        hooks.append(layer.mhc_attn.register_forward_pre_hook(_make_pre_hook("attn"), with_kwargs=True))
+        hooks.append(layer.mhc_mlp.register_forward_pre_hook(_make_pre_hook("mlp"), with_kwargs=True))
+
+    try:
+        with torch.no_grad():
+            mhc_model(
+                input_ids=input_ids.to(device),
+                attention_mask=None if attention_mask is None else attention_mask.to(device),
+                use_cache=False,
+            )
+    finally:
+        for h in hooks:
+            h.remove()
+
+    if not collected:
+        raise RuntimeError("Failed to collect any H_res matrices (no hooks fired)")
+
+    return torch.stack(collected, dim=0)
+
+
+def _compute_mhc_mappings(
+    mhc_model_path: str,
+    sequence: str,
+    base_model: str,
+    device: str,
+    torch_dtype: "torch.dtype",
+    max_length: int,
+) -> Dict[str, np.ndarray]:
     import torch
 
     from src.conversion import load_mhc_model
-    from src.sinkhorn import sinkhorn_knopp
 
-    mhc_model, _ = load_mhc_model(mhc_model_path, device="cpu", torch_dtype=torch.float32)
+    mhc_model, tokenizer = load_mhc_model(
+        mhc_model_path,
+        device=device,
+        torch_dtype=torch_dtype,
+        base_model=base_model,
+    )
     mhc_model.eval()
 
-    n_layers = len(mhc_model.model.layers)
-    single_amax: List[float] = []
-    composite_amax: List[float] = []
+    enc = tokenizer(
+        sequence,
+        return_tensors="pt",
+        truncation=True,
+        max_length=max_length,
+    )
+    input_ids = enc["input_ids"]
+    attention_mask = enc.get("attention_mask")
 
-    composite = torch.eye(4, dtype=torch.float32)
+    h_all = _collect_h_res_per_sublayer(
+        mhc_model=mhc_model,
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        device=device,
+    )  # (L2, B, S, n, n)
 
-    for layer in mhc_model.model.layers:
-        # Use static (parameter-derived) H_res for attention + mlp
-        h_attn = sinkhorn_knopp(layer.mhc_attn.b_res).squeeze().detach().cpu()  # (4,4)
-        h_mlp = sinkhorn_knopp(layer.mhc_mlp.b_res).squeeze().detach().cpu()    # (4,4)
+    # Single-layer gain: average over tokens in the selected sequence.
+    single_gain = _amax_gain_magnitude_from_h_res(h_all).mean(dim=(1, 2)).cpu()  # (L2,)
 
-        # Per-transformer-layer mapping: attention mixing then mlp mixing
-        m_l = h_mlp @ h_attn
+    # Composite suffix mapping per l:  Π_{i=1}^{L2-l} H_res^{L2-i}
+    # which corresponds to: H_res[L2-1] @ ... @ H_res[l]
+    L2 = h_all.shape[0]
+    B, S, n, _ = h_all.shape[1:]
+    suffix = torch.eye(n, dtype=h_all.dtype).view(1, 1, n, n).expand(B, S, n, n).clone()
+    composite = torch.empty_like(h_all)
+    for k in range(L2 - 1, -1, -1):
+        suffix = torch.matmul(suffix, h_all[k])
+        composite[k] = suffix
 
-        single_amax.append(float(m_l.abs().max().item()))
-
-        composite = m_l @ composite
-        composite_amax.append(float(composite.abs().max().item()))
+    composite_gain = _amax_gain_magnitude_from_h_res(composite).mean(dim=(1, 2)).cpu()  # (L2,)
 
     return {
-        "layer_idx": np.arange(n_layers, dtype=np.int64),
-        "single_layer_amax": np.asarray(single_amax, dtype=np.float64),
-        "composite_amax": np.asarray(composite_amax, dtype=np.float64),
+        "layer_idx": np.arange(L2, dtype=np.int64),
+        "single_layer_gain": single_gain.numpy().astype(np.float64),
+        "composite_gain": composite_gain.numpy().astype(np.float64),
     }
 
 
@@ -132,6 +234,17 @@ def main():
     p.add_argument("--standard-log", type=str, default=None, help="Path to standard model train.log")
     p.add_argument("--mhc-log", type=str, default=None, help="Path to mHC model train.log")
     p.add_argument("--mhc-model", type=str, default=None, help="Path to mHC checkpoint dir (for mapping plots)")
+    p.add_argument("--sequence", type=str, default=None, help="Text sequence used to compute token-averaged H_res gain metrics")
+    p.add_argument("--base-model", type=str, default="Qwen/Qwen3-0.6B", help="Base HF model name/path for tokenizer")
+    p.add_argument("--device", type=str, default="cpu", help="Device for mapping computation (e.g. cpu, cuda)")
+    p.add_argument(
+        "--dtype",
+        type=str,
+        default="float32",
+        choices=["float32", "float16", "bfloat16"],
+        help="Dtype for mapping computation",
+    )
+    p.add_argument("--max-length", type=int, default=256, help="Max sequence length for mapping computation")
     p.add_argument("--outdir", type=str, default="./plots", help="Output directory for PNGs")
     args = p.parse_args()
 
@@ -206,19 +319,36 @@ def main():
 
     # --- Mapping plots (single-layer + composite amax gain) ---
     if args.mhc_model:
-        mapping = _compute_mhc_mappings(args.mhc_model)
+        if not args.sequence:
+            raise SystemExit("--sequence is required when using --mhc-model (needed for token-averaged H_res metrics).")
+
+        import torch
+
+        dtype_map = {
+            "float32": torch.float32,
+            "float16": torch.float16,
+            "bfloat16": torch.bfloat16,
+        }
+        mapping = _compute_mhc_mappings(
+            mhc_model_path=args.mhc_model,
+            sequence=args.sequence,
+            base_model=args.base_model,
+            device=args.device,
+            torch_dtype=dtype_map[args.dtype],
+            max_length=args.max_length,
+        )
 
         fig = plt.figure(figsize=(10, 5))
         ax = fig.add_subplot(1, 1, 1)
-        ax.plot(mapping["layer_idx"], mapping["single_layer_amax"], marker="o", markersize=3, label="single-layer mapping amax")
-        ax.plot(mapping["layer_idx"], mapping["composite_amax"], marker="s", markersize=3, label="composite mapping amax")
-        ax.set_title("amax(|mapping|) vs layer index")
+        ax.plot(mapping["layer_idx"], mapping["single_layer_gain"], marker="o", markersize=3, label="single-layer H_res gain")
+        ax.plot(mapping["layer_idx"], mapping["composite_gain"], marker="s", markersize=3, label="composite suffix gain")
+        ax.set_title("Amax Gain Magnitude vs unrolled layer index")
         ax.set_xlabel("layer index l")
-        ax.set_ylabel("amax(|M|)")
+        ax.set_ylabel("Amax Gain Magnitude")
         ax.grid(True, alpha=0.3)
         ax.legend()
 
-        out_path = os.path.join(args.outdir, "mapping_amax_gain_vs_layer.png")
+        out_path = os.path.join(args.outdir, "mapping_gain_vs_layer.png")
         fig.tight_layout()
         fig.savefig(out_path, dpi=150)
         plt.close(fig)
