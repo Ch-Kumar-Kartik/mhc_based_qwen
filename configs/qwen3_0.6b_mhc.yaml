@@ -15,16 +15,16 @@ training:
   adam_epsilon: 1.0e-20
   
   # Schedule
-  warmup_steps: 2000
-  total_steps: 30000
+  warmup_steps: 100
+  total_steps: 1500
   lr_decay_style: "step"
   lr_decay_ratio_1: 0.316  # at 80%
   lr_decay_ratio_2: 0.1    # at 90%
   
   # Batch settings
-  batch_size: 320
-  sequence_length: 4096
-  gradient_accumulation_steps: 1
+  batch_size: 1
+  sequence_length: 256
+  gradient_accumulation_steps: 4
   
   # Checkpointing
   checkpoint_interval: 1000

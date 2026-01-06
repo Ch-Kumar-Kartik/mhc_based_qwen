@@ -65,9 +65,9 @@ def summarize_all_layers(mhc_model):
     print(f"(* = layer with significant drift from identity)")
     
     if total_drift < 0.1:
-        print(f"\n⚠️  Very little training detected! Model looks mostly unchanged from init.")
+        print(f"\n  Very little training detected! Model looks mostly unchanged from init.")
     else:
-        print(f"\n✅ Model shows training - parameters have drifted from initialization.")
+        print(f"\n Model shows training - parameters have drifted from initialization.")
     
     return max_drift_layer
 
@@ -96,7 +96,7 @@ def visualize_layer_static(mhc_model, layer_idx: int):
         
         # H_pre from b_pre
         h_pre = torch.softmax(mhc.b_pre, dim=-1).squeeze()
-        print(f"\n  📥 H_pre (squeeze 4→1, init=[0.25]*4):")
+        print(f"\n   H_pre (squeeze 4→1, init=[0.25]*4):")
         print(f"     Weights: {[f'{v:.4f}' for v in h_pre.tolist()]}")
         print(f"     Sum: {h_pre.sum().item():.4f}")
         print(f"     Interpretation: Stream contributions to sublayer input")
@@ -109,7 +109,7 @@ def visualize_layer_static(mhc_model, layer_idx: int):
         
         # H_post from b_post
         h_post = (2.0 * torch.sigmoid(mhc.b_post)).squeeze()
-        print(f"\n  📤 H_post (expand 1→4, init=[1.0]*4, range [0,2]):")
+        print(f"\n   H_post (expand 1→4, init=[1.0]*4, range [0,2]):")
         print(f"     Weights: {[f'{v:.4f}' for v in h_post.tolist()]}")
         print(f"     Interpretation: How sublayer output is distributed to streams")
         
@@ -121,7 +121,7 @@ def visualize_layer_static(mhc_model, layer_idx: int):
         
         # H_res from b_res via Sinkhorn
         h_res = sinkhorn_knopp(mhc.b_res).squeeze()
-        print(f"\n  🔀 H_res (stream mixing, init=identity, doubly stochastic):")
+        print(f"\n   H_res (stream mixing, init=identity, doubly stochastic):")
         print(f"     Matrix (row i = how stream i mixes into new streams):")
         for i in range(4):
             row = h_res[i].tolist()
@@ -210,7 +210,7 @@ def main():
     # Compare to init
     compare_init_vs_trained(mhc_model, layer_idx)
     
-    print("\n✅ Visualization complete!")
+    print("\n Visualization complete!")
 
 
 if __name__ == "__main__":

@@ -152,57 +152,94 @@ def main():
     import matplotlib.pyplot as plt
 
     # --- Training plots (loss gap + grad norm) ---
-    if args.standard_log and args.mhc_log:
+    std = None
+    mhc = None
+    
+    if args.standard_log:
         std = _load_step_series_from_log(args.standard_log)
+    if args.mhc_log:
         mhc = _load_step_series_from_log(args.mhc_log)
 
+    # Loss gap requires BOTH logs
+    if std is not None and mhc is not None:
         common_steps, std_loss, mhc_loss = _align_by_step(std, mhc)
         loss_gap = np.abs(mhc_loss - std_loss)
 
-        fig = plt.figure(figsize=(12, 6))
-        ax1 = fig.add_subplot(1, 2, 1)
+        fig = plt.figure(figsize=(10, 5))
+        ax1 = fig.add_subplot(1, 1, 1)
         ax1.plot(common_steps, loss_gap, linewidth=1.5)
         ax1.set_title("Absolute training loss gap")
         ax1.set_xlabel("training step")
         ax1.set_ylabel("|loss_mhc - loss_standard|")
         ax1.grid(True, alpha=0.3)
 
-        ax2 = fig.add_subplot(1, 2, 2)
-        # Prefer mHC grad_norm if available; otherwise standard.
-        grad_series = None
-        grad_steps = None
-        if mhc.grad_norm is not None:
-            grad_series = mhc.grad_norm
-            grad_steps = mhc.steps
-            label = "mHC grad_norm"
-        elif std.grad_norm is not None:
-            grad_series = std.grad_norm
-            grad_steps = std.steps
-            label = "standard grad_norm"
-        else:
-            label = None
+        out_path = os.path.join(args.outdir, "training_loss_gap.png")
+        fig.tight_layout()
+        fig.savefig(out_path, dpi=150)
+        plt.close(fig)
+        print(f"Saved: {out_path}")
+    elif args.standard_log or args.mhc_log:
+        print("Note: provide BOTH --standard-log and --mhc-log to plot loss gap.")
 
-        if grad_series is not None:
-            ax2.plot(grad_steps, grad_series, linewidth=1.5)
-            ax2.set_title("Gradient norm vs steps")
-            ax2.set_xlabel("training step")
-            ax2.set_ylabel("grad_norm")
-            ax2.grid(True, alpha=0.3)
-            if label:
-                ax2.legend([label])
-        else:
-            ax2.text(0.5, 0.5, "No grad_norm found in logs", ha="center", va="center")
-            ax2.set_axis_off()
+    # Training loss curve can be plotted from a SINGLE log
+    loss_series = None
+    loss_steps = None
+    loss_label = None
+    if mhc is not None:
+        loss_series = mhc.loss
+        loss_steps = mhc.steps
+        loss_label = "mHC training loss"
+    elif std is not None:
+        loss_series = std.loss
+        loss_steps = std.steps
+        loss_label = "standard training loss"
 
-        out_path = os.path.join(args.outdir, "training_loss_gap_and_grad_norm.png")
+    if loss_series is not None:
+        fig = plt.figure(figsize=(10, 5))
+        ax = fig.add_subplot(1, 1, 1)
+        ax.plot(loss_steps, loss_series, linewidth=1.5, label=loss_label, alpha=0.8)
+        ax.set_title("Training loss vs steps")
+        ax.set_xlabel("training step")
+        ax.set_ylabel("loss")
+        ax.grid(True, alpha=0.3)
+        ax.legend()
+
+        out_path = os.path.join(args.outdir, "training_loss_curve.png")
         fig.tight_layout()
         fig.savefig(out_path, dpi=150)
         plt.close(fig)
         print(f"Saved: {out_path}")
 
-    else:
-        if args.standard_log or args.mhc_log:
-            print("Note: provide BOTH --standard-log and --mhc-log to plot loss gap.")
+    # Grad norm can be plotted from a SINGLE log
+    grad_series = None
+    grad_steps = None
+    label = None
+    if mhc is not None and mhc.grad_norm is not None:
+        grad_series = mhc.grad_norm
+        grad_steps = mhc.steps
+        label = "mHC grad_norm"
+    elif std is not None and std.grad_norm is not None:
+        grad_series = std.grad_norm
+        grad_steps = std.steps
+        label = "standard grad_norm"
+
+    if grad_series is not None:
+        fig = plt.figure(figsize=(10, 5))
+        ax = fig.add_subplot(1, 1, 1)
+        ax.plot(grad_steps, grad_series, linewidth=1.5, label=label)
+        ax.set_title("Gradient norm vs steps")
+        ax.set_xlabel("training step")
+        ax.set_ylabel("grad_norm")
+        ax.grid(True, alpha=0.3)
+        ax.legend()
+
+        out_path = os.path.join(args.outdir, "training_grad_norm.png")
+        fig.tight_layout()
+        fig.savefig(out_path, dpi=150)
+        plt.close(fig)
+        print(f"Saved: {out_path}")
+    elif args.standard_log or args.mhc_log:
+        print("Note: no grad_norm data found in the provided log(s).")
 
     # --- Mapping plots (single-layer + composite amax gain) ---
     if args.mhc_model:

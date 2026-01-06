@@ -163,7 +163,10 @@ class MHCTrainer:
         self.model.train()
         
         if self.config.gradient_checkpointing:
-            self.model.gradient_checkpointing_enable()
+            try:
+                self.model.gradient_checkpointing_enable()
+            except ValueError as e:
+                self.logger.warning(f"Gradient checkpointing not available: {e}")
         
         epoch = 0
         while self.global_step < self.config.total_steps:
@@ -316,6 +319,96 @@ def load_config(config_path: str) -> MHCTrainingConfig:
     return MHCTrainingConfig(**config_dict.get('training', {}))
 
 
+def load_hf_dataset(
+    data_path: str,
+    tokenizer,
+    max_length: int = 4096,
+    batch_size: int = 1,
+    split: str = "train",
+):
+    """Load dataset from HuggingFace hub or local path.
+    
+    Args:
+        data_path: HuggingFace dataset name or local path
+        tokenizer: Tokenizer for encoding
+        max_length: Maximum sequence length
+        batch_size: Batch size for DataLoader
+        split: Dataset split to use
+        
+    Returns:
+        DataLoader for the dataset
+    """
+    from datasets import load_dataset
+    
+    logger = logging.getLogger(__name__)
+    logger.info(f"Loading dataset: {data_path}")
+    
+    # Load dataset
+    try:
+        # Check if it's a dataset with a config name (e.g., "wikitext" with "wikitext-2-raw-v1")
+        if "/" in data_path:
+            parts = data_path.split("/")
+            if len(parts) == 2:
+                # Could be "org/dataset" or "dataset/config"
+                try:
+                    dataset = load_dataset(data_path, split=split)
+                except Exception:
+                    # Try as dataset with config
+                    dataset = load_dataset(parts[0], parts[1], split=split)
+            else:
+                dataset = load_dataset(data_path, split=split)
+        else:
+            dataset = load_dataset(data_path, split=split)
+    except Exception as e:
+        logger.warning(f"HuggingFace dataset load failed: {e}")
+        # Try as local path
+        dataset = load_dataset("json", data_files=data_path, split=split)
+    
+    # Determine text column
+    text_column = None
+    for col in ["text", "content", "input", "prompt"]:
+        if col in dataset.column_names:
+            text_column = col
+            break
+    
+    if text_column is None:
+        text_column = dataset.column_names[0]
+        logger.warning(f"No standard text column found, using '{text_column}'")
+    
+    def tokenize_function(examples):
+        # Tokenize and create labels for causal LM
+        tokenized = tokenizer(
+            examples[text_column],
+            truncation=True,
+            max_length=max_length,
+            padding="max_length",
+            return_tensors=None,
+        )
+        tokenized["labels"] = tokenized["input_ids"].copy()
+        return tokenized
+    
+    # Tokenize dataset
+    tokenized_dataset = dataset.map(
+        tokenize_function,
+        batched=True,
+        remove_columns=dataset.column_names,
+        desc="Tokenizing",
+    )
+    
+    # Set format for PyTorch
+    tokenized_dataset.set_format(type="torch", columns=["input_ids", "attention_mask", "labels"])
+    
+    # Create DataLoader
+    dataloader = DataLoader(
+        tokenized_dataset,
+        batch_size=batch_size,
+        shuffle=(split == "train"),
+    )
+    
+    logger.info(f"Dataset loaded: {len(tokenized_dataset)} examples, {len(dataloader)} batches")
+    return dataloader
+
+
 def main():
     parser = argparse.ArgumentParser(description="Train mHC model")
     
@@ -377,21 +470,40 @@ def main():
     logger.info(f"  Original: {param_counts['original']:,}")
     logger.info(f"  mHC:      {param_counts['mhc']:,} ({param_counts['mhc_percentage']:.1f}%)")
     
-    # TODO: Load dataset and create dataloaders
-    # This would be customized based on the specific training data
-    logger.info("Note: Dataset loading not implemented - please provide your own DataLoader")
+    # Load dataset
+    logger.info(f"Loading dataset from {args.data}")
+    train_dataloader = load_hf_dataset(
+        data_path=args.data,
+        tokenizer=tokenizer,
+        max_length=config.sequence_length,
+        batch_size=config.batch_size,
+        split="train",
+    )
     
-    # Example of how training would be started:
-    # trainer = MHCTrainer(
-    #     model=model,
-    #     config=config,
-    #     train_dataloader=train_dataloader,
-    #     eval_dataloader=eval_dataloader,
-    #     output_dir=args.output,
-    # )
-    # trainer.train()
+    # Try to load eval split if available
+    eval_dataloader = None
+    try:
+        eval_dataloader = load_hf_dataset(
+            data_path=args.data,
+            tokenizer=tokenizer,
+            max_length=config.sequence_length,
+            batch_size=config.batch_size,
+            split="validation",
+        )
+    except Exception as e:
+        logger.warning(f"No validation split found: {e}")
     
-    logger.info("Training script loaded successfully. Implement data loading to start training.")
+    # Create trainer and start training
+    trainer = MHCTrainer(
+        model=model,
+        config=config,
+        train_dataloader=train_dataloader,
+        eval_dataloader=eval_dataloader,
+        output_dir=args.output,
+    )
+    trainer.train()
+    
+    logger.info("Training completed!")
 
 
 if __name__ == "__main__":
