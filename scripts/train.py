@@ -174,7 +174,7 @@ class MHCTrainer:
                 if self.global_step >= self.config.total_steps:
                     break
                 
-                loss = self._training_step(batch)
+                loss, grad_norm = self._training_step(batch)
                 
                 # Check for instability
                 if self._check_instability(loss):
@@ -185,7 +185,7 @@ class MHCTrainer:
                 
                 # Logging
                 if self.global_step % self.config.log_interval == 0:
-                    self._log_metrics(loss)
+                    self._log_metrics(loss, grad_norm)
                 
                 # Evaluation
                 if self.eval_dataloader and self.global_step % self.config.eval_interval == 0:
@@ -198,7 +198,7 @@ class MHCTrainer:
         self.logger.info("Training completed!")
         self._save_checkpoint(final=True)
     
-    def _training_step(self, batch: Dict[str, torch.Tensor]) -> float:
+    def _training_step(self, batch: Dict[str, torch.Tensor]) -> tuple[float, float]:
         """Execute single training step."""
         self.optimizer.zero_grad()
         
@@ -228,7 +228,7 @@ class MHCTrainer:
         self.optimizer.step()
         self.scheduler.step()
         
-        return loss.item()
+        return loss.item(), float(grad_norm)
     
     def _check_instability(self, loss: float) -> bool:
         """Check for training instability."""
@@ -252,12 +252,12 @@ class MHCTrainer:
         
         return False
     
-    def _log_metrics(self, loss: float):
+    def _log_metrics(self, loss: float, grad_norm: float):
         """Log training metrics."""
         lr = self.optimizer.param_groups[0]['lr']
         
         self.logger.info(
-            f"Step {self.global_step}: loss={loss:.4f}, lr={lr:.2e}"
+            f"Step {self.global_step}: loss={loss:.4f}, lr={lr:.2e}, grad_norm={grad_norm:.2f}"
         )
     
     def _evaluate(self):
