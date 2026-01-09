@@ -404,10 +404,15 @@ def load_mhc_model(
     Returns:
         Tuple of (model, tokenizer).
     """
+    # Check if model_path is a local directory
+    model_path_obj = Path(model_path)
+    is_local = model_path_obj.exists() and model_path_obj.is_dir()
+    
     model = Qwen3MHCForCausalLM.from_pretrained(
         model_path,
         torch_dtype=torch_dtype,
         device_map=device,
+        local_files_only=is_local,
     )
     
     # Load tokenizer from base model since mHC uses same tokenizer

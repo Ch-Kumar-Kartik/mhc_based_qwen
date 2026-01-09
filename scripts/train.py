@@ -326,11 +326,11 @@ def load_hf_dataset(
     batch_size: int = 1,
     split: str = "train",
 ):
-    """Load dataset from HuggingFace hub or local path.
+    """Load dataset from HuggingFace hub, local path, or pre-tokenized Arrow format.
     
     Args:
-        data_path: HuggingFace dataset name or local path
-        tokenizer: Tokenizer for encoding
+        data_path: HuggingFace dataset name, local JSON path, or Arrow dataset path
+        tokenizer: Tokenizer for encoding (unused if data is pre-tokenized)
         max_length: Maximum sequence length
         batch_size: Batch size for DataLoader
         split: Dataset split to use
@@ -338,12 +338,37 @@ def load_hf_dataset(
     Returns:
         DataLoader for the dataset
     """
-    from datasets import load_dataset
+    from datasets import load_dataset, load_from_disk
     
     logger = logging.getLogger(__name__)
     logger.info(f"Loading dataset: {data_path}")
     
-    # Load dataset
+    # Check if it's a pre-tokenized Arrow dataset (from download.py)
+    arrow_path = Path(data_path)
+    if arrow_path.exists() and arrow_path.is_dir():
+        # Check for Arrow dataset markers
+        if (arrow_path / "dataset_info.json").exists() or (arrow_path / "state.json").exists():
+            logger.info("Detected pre-tokenized Arrow dataset, loading directly...")
+            dataset = load_from_disk(str(arrow_path))
+            
+            # Verify it has required columns
+            required_cols = {"input_ids", "attention_mask", "labels"}
+            if required_cols.issubset(set(dataset.column_names)):
+                logger.info("Dataset already tokenized, skipping tokenization")
+                dataset.set_format(type="torch", columns=["input_ids", "attention_mask", "labels"])
+                
+                dataloader = DataLoader(
+                    dataset,
+                    batch_size=batch_size,
+                    shuffle=(split == "train"),
+                )
+                
+                logger.info(f"Dataset loaded: {len(dataset)} examples, {len(dataloader)} batches")
+                return dataloader
+            else:
+                logger.warning(f"Arrow dataset missing columns, will re-tokenize. Found: {dataset.column_names}")
+    
+    # Load dataset from HuggingFace or JSON
     try:
         # Check if it's a dataset with a config name (e.g., "wikitext" with "wikitext-2-raw-v1")
         if "/" in data_path:
