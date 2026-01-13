@@ -12,8 +12,13 @@ Optimizations:
 - Prefetching and async data loading
 
 Usage:
+    # Using HuggingFace reasoning datasets
     python scripts/train_amd.py --dataset openthoughts114k --max-examples 50000
     python scripts/train_amd.py --dataset openthoughts3  # Full 1.2M dataset
+    
+    # Using local pre-tokenized dataset from data/ directory (created by download.py)
+    python scripts/train_amd.py --data-path ./data/fineweb_edu_qwen3
+    python scripts/train_amd.py --data-path ./data/fineweb_edu_qwen3 --max-examples 5000
 """
 
 import argparse
@@ -34,6 +39,8 @@ from torch.cuda.amp import GradScaler, autocast
 
 # Add src to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from datasets import load_from_disk
 
 from src.config import MHCTrainingConfig
 from src.conversion import load_mhc_model, convert_qwen3_to_mhc, count_parameters
@@ -513,7 +520,11 @@ def main():
     parser.add_argument(
         "--dataset", type=str, default="openthoughts114k",
         choices=list(REASONING_DATASETS.keys()),
-        help="Reasoning dataset to use",
+        help="Reasoning dataset to use (ignored if --data-path is set)",
+    )
+    parser.add_argument(
+        "--data-path", type=str, default=None,
+        help="Path to local pre-tokenized dataset (e.g., ./data/fineweb_edu_qwen3). If set, --dataset is ignored.",
     )
     parser.add_argument(
         "--max-examples", type=int, default=None,
@@ -605,14 +616,38 @@ def main():
     logger.info(f"  mHC: {param_counts['mhc']:,} ({param_counts['mhc_percentage']:.1f}%)")
     
     # Load dataset
-    logger.info(f"Loading dataset: {args.dataset}")
-    train_dataset = load_reasoning_dataset(
-        args.dataset,
-        tokenizer,
-        max_length=config.max_length,
-        max_examples=args.max_examples,
-        packing=args.packing,
-    )
+    if args.data_path:
+        # Load local pre-tokenized dataset (from download.py)
+        data_path = Path(args.data_path)
+        if not data_path.exists():
+            raise FileNotFoundError(f"Dataset path not found: {data_path}")
+        
+        logger.info(f"Loading local dataset from: {data_path}")
+        train_dataset = load_from_disk(str(data_path))
+        
+        # Verify required columns exist
+        required_cols = {"input_ids", "attention_mask", "labels"}
+        if not required_cols.issubset(set(train_dataset.column_names)):
+            raise ValueError(f"Dataset missing required columns. Found: {train_dataset.column_names}, need: {required_cols}")
+        
+        # Set format for PyTorch
+        train_dataset.set_format(type="torch", columns=["input_ids", "attention_mask", "labels"])
+        
+        # Apply max_examples limit if specified
+        if args.max_examples and args.max_examples < len(train_dataset):
+            train_dataset = train_dataset.select(range(args.max_examples))
+        
+        logger.info(f"Dataset loaded: {len(train_dataset)} examples")
+    else:
+        # Load from HuggingFace reasoning datasets
+        logger.info(f"Loading dataset: {args.dataset}")
+        train_dataset = load_reasoning_dataset(
+            args.dataset,
+            tokenizer,
+            max_length=config.max_length,
+            max_examples=args.max_examples,
+            packing=args.packing,
+        )
     logger.info(f"Training examples: {len(train_dataset)}")
     
     # Custom collate function for packed datasets (filters out metadata)
