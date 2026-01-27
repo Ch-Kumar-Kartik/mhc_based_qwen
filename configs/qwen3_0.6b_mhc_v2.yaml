@@ -1,0 +1,61 @@
+# Training configuration for Qwen3-0.6B with mHC V2
+# Based on hyper-connections paper approach
+
+model:
+  name: "Qwen/Qwen3-0.6B"
+  n_streams: 4
+  num_fracs: 1  # Frac-connections parameter (1 = standard mHC)
+  sinkhorn_iters: 20
+  log_domain_sinkhorn: false
+  dtype: "bfloat16"
+
+training:
+  # Optimizer settings (from paper)
+  learning_rate: 8.6e-4
+  weight_decay: 0.1
+  adam_beta1: 0.9
+  adam_beta2: 0.95
+  adam_epsilon: 1.0e-20
+  
+  # Schedule
+  warmup_steps: 100
+  total_steps: 1500
+  lr_decay_style: "step"
+  lr_decay_ratio_1: 0.316  # at 80%
+  lr_decay_ratio_2: 0.1    # at 90%
+  
+  # Batch settings
+  batch_size: 1
+  sequence_length: 256
+  gradient_accumulation_steps: 4
+  
+  # Checkpointing
+  checkpoint_interval: 500
+  gradient_checkpointing: true
+  checkpoint_every_n_layers: 4
+  
+  # Stability monitoring
+  gradient_norm_threshold: 10.0
+  forward_gain_threshold: 2.0
+  backward_gain_threshold: 2.0
+  loss_spike_threshold: 2.0
+  
+  # Logging
+  log_interval: 10
+  eval_interval: 500
+
+data:
+  # Dataset configuration (customize as needed)
+  train_path: null
+  eval_path: null
+  tokenizer: "Qwen/Qwen3-0.6B"
+  max_length: 4096
+  
+output:
+  dir: "./output/qwen3_mhc_v2"
+  save_total_limit: 3
+  
+wandb:
+  enabled: false
+  project: "qwen3-mhc-v2"
+  name: null

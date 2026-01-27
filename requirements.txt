@@ -15,6 +15,9 @@ datasets>=2.16.0
 wandb>=0.16.0
 tensorboard>=2.15.0
 
+# Utilities
+einops>=0.6.0
+
 # Development
 pytest>=7.4.0
 pytest-cov>=4.1.0
