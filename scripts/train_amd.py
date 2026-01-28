@@ -536,11 +536,11 @@ def main():
     )
     
     # Training
-    parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--grad-accum", type=int, default=8)
     parser.add_argument("--max-length", type=int, default=2048)
     parser.add_argument("--lr", type=float, default=5e-5)
-    parser.add_argument("--total-steps", type=int, default=10000)
+    parser.add_argument("--total-steps", type=int, default=50000)
     parser.add_argument("--warmup-ratio", type=float, default=0.1)
     parser.add_argument("--save-interval", type=int, default=100, help="Save checkpoint every N steps")
     
