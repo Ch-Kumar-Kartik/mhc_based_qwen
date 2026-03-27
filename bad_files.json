@@ -1,0 +1,10 @@
+[
+  {
+    "path": "E:\\mhc_based_qwen-2\\hf_cache\\hub\\datasets--ai4bharat--IndicCorpV2\\snapshots\\2d7285e6ce14fdb3fb2449c9f89427b9f582ac3f\\data\\hi-2.txt",
+    "error": "UnicodeDecodeError at position 0: unexpected end of data"
+  },
+  {
+    "path": "E:\\mhc_based_qwen-2\\hf_cache\\hub\\datasets--ai4bharat--IndicCorpV2\\snapshots\\2d7285e6ce14fdb3fb2449c9f89427b9f582ac3f\\data\\hi-3.txt",
+    "error": "UnicodeDecodeError at position 0: invalid start byte"
+  }
+]

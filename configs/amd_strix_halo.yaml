@@ -1,0 +1,107 @@
+# AMD Strix Halo iGPU Optimized Configuration
+# Hardware: AMD Strix Halo iGPU (gfx120x) with 128GB unified RAM
+# Target: Maximum throughput for CoT reasoning training
+
+# =============================================================================
+# QUICK START
+# =============================================================================
+# 
+# Option 1: Small test run (recommended first)
+#   python scripts/train_amd.py --dataset openthoughts114k --max-examples 5000 --total-steps 500
+#
+# Option 2: Medium training run
+#   python scripts/train_amd.py --dataset openthoughts114k --total-steps 5000
+#
+# Option 3: Full training (overnight)
+#   python scripts/train_amd.py --dataset openthoughts3 --total-steps 30000
+#
+# =============================================================================
+
+model:
+  base: "Qwen/Qwen3-0.6B"
+  n_streams: 4
+  dtype: "bfloat16"
+
+# AMD Strix Halo optimized settings
+hardware:
+  # 128GB unified memory allows larger batches than typical GPUs
+  device: "cuda"  # ROCm uses CUDA API
+  
+  # Memory is unified, so no need to pin
+  pin_memory: false
+  
+  # Use all CPU cores for data loading
+  num_workers: 8
+  prefetch_factor: 4
+
+training:
+  # Batch settings - tuned for 128GB unified memory
+  # Start conservative, increase if no OOM
+  batch_size: 8              # Per accumulation step
+  gradient_accumulation_steps: 4  # Effective batch = 32
+  max_length: 2048           # Sequence length
+  
+  # Learning rate - lower for fine-tuning
+  learning_rate: 5.0e-5
+  weight_decay: 0.01
+  adam_beta1: 0.9
+  adam_beta2: 0.95
+  adam_epsilon: 1.0e-8
+  max_grad_norm: 1.0
+  
+  # Schedule
+  warmup_ratio: 0.1
+  total_steps: 10000
+  
+  # Memory optimizations (critical for iGPU)
+  gradient_checkpointing: true
+  
+  # torch.compile for ROCm (experimental but can help)
+  use_compile: true
+  compile_mode: "reduce-overhead"  # or "max-autotune" for more speed
+  
+  # Logging
+  log_interval: 10
+  eval_interval: 500
+  save_interval: 1000
+
+data:
+  # Dataset selection
+  # openthoughts114k: 114K examples, good for testing
+  # openthoughts3: 1.2M examples, full training
+  dataset: "openthoughts114k"
+  max_examples: null  # null = use all
+  
+output:
+  dir: "./output/mhc_strix_halo"
+  save_total_limit: 3
+
+# =============================================================================
+# PERFORMANCE TUNING NOTES
+# =============================================================================
+#
+# If you get OOM errors:
+#   1. Reduce batch_size to 4 or 2
+#   2. Reduce max_length to 1024
+#   3. Increase gradient_accumulation_steps to maintain effective batch size
+#
+# If training is slow:
+#   1. Try compile_mode: "max-autotune" (slower compile, faster training)
+#   2. Increase batch_size if memory allows
+#   3. Increase num_workers
+#
+# For maximum quality:
+#   1. Use openthoughts3 dataset (1.2M examples)
+#   2. Train for 30000+ steps
+#   3. Use max_length: 4096 if memory allows
+#
+# =============================================================================
+# EXPECTED PERFORMANCE (approximate)
+# =============================================================================
+#
+# With batch_size=8, grad_accum=4, max_length=2048:
+#   - Memory usage: ~40-60GB
+#   - Throughput: ~500-1000 tokens/sec
+#   - Time for 10K steps: ~6-12 hours
+#
+# =============================================================================
