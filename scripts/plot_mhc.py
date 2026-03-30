@@ -18,7 +18,7 @@ import argparse
 import torch
 import numpy as np
 
-from src.conversion import load_mhc_model
+from src.conversionV2 import load_mhc_model_v2
 from src.sinkhorn import sinkhorn_knopp
 
 # Try to import matplotlib, fall back to ASCII if not available
@@ -34,6 +34,34 @@ except ImportError:
 def collect_layer_data(mhc_model):
     """Collect H_res matrices and other data from all layers (static analysis)."""
     n_layers = len(mhc_model.model.layers)
+
+    def extract_static_matrices(mhc):
+        """Derive static constrained matrices from V2 parameters."""
+        s = mhc.num_residual_streams
+        f = mhc.num_fracs
+        v = mhc.num_input_views
+
+        static_alpha = mhc.static_alpha.detach().float()
+        sf = s * f
+        vf = v * f
+
+        alpha_pre = torch.sigmoid(static_alpha[:, :vf])
+        alpha_residual = mhc.residual_mix_constraint_fn(static_alpha[:, vf:])
+
+        # Collapse frac/view dimensions for per-stream summary visualizations.
+        alpha_pre = alpha_pre.reshape(s, f, v, f).mean(dim=(1, 2, 3))
+        alpha_residual = alpha_residual.reshape(s, f, s, f).mean(dim=(1, 3))
+
+        if hasattr(mhc, "static_beta"):
+            beta = (2.0 * torch.sigmoid(mhc.static_beta.detach().float())).mean(dim=(1, 2))
+        else:
+            beta = torch.full((s,), float("nan"))
+
+        return (
+            alpha_pre.cpu().numpy(),
+            alpha_residual.cpu().numpy(),
+            beta.cpu().numpy(),
+        )
     
     # Storage
     h_res_attn = []
@@ -47,29 +75,27 @@ def collect_layer_data(mhc_model):
     for layer in mhc_model.model.layers:
         # Attention mHC
         mhc = layer.mhc_attn
-        
-        # Compute H matrices from parameters
-        h_pre = torch.softmax(mhc.b_pre, dim=-1).squeeze().detach().cpu().numpy()
-        h_post = (2.0 * torch.sigmoid(mhc.b_post)).squeeze().detach().cpu().numpy()
-        h_res = sinkhorn_knopp(mhc.b_res).squeeze().detach().cpu().numpy()
+
+        # Compute static constrained matrices from V2 parameters.
+        h_pre, h_res, h_post = extract_static_matrices(mhc)
         
         h_res_attn.append(h_res)
         h_pre_attn.append(h_pre)
         h_post_attn.append(h_post)
-        
+
         # MLP mHC
-        h_res_mlp_mat = sinkhorn_knopp(layer.mhc_mlp.b_res).squeeze().detach().cpu().numpy()
+        _, h_res_mlp_mat, _ = extract_static_matrices(layer.mhc_mlp)
         h_res_mlp.append(h_res_mlp_mat)
-        
-        # Alpha values
-        alphas_pre.append(mhc.alpha_pre.item())
-        alphas_post.append(mhc.alpha_post.item())
-        alphas_res.append(mhc.alpha_res.item())
+
+        # V2 scalar gates controlling dynamic coefficient magnitude.
+        alphas_pre.append(mhc.pre_branch_scale.detach().item())
+        alphas_post.append(mhc.h_post_scale.detach().item() if hasattr(mhc, "h_post_scale") else float("nan"))
+        alphas_res.append(mhc.residual_scale.detach().item())
     
     # Compute H_res identity distances
     identity_distances = []
-    identity = np.eye(4)
     for h_res in h_res_attn:
+        identity = np.eye(h_res.shape[0])
         dist = np.abs(h_res - identity).mean()
         identity_distances.append(dist)
     
@@ -89,38 +115,43 @@ def collect_layer_data(mhc_model):
 def plot_matplotlib(data: dict, output_path: str):
     """Create matplotlib visualization."""
     n_layers = data['n_layers']
+    n_streams = data['h_res_attn'].shape[-1]
     
     fig = plt.figure(figsize=(20, 14))
     gs = gridspec.GridSpec(4, 2, height_ratios=[2, 1, 1, 1], hspace=0.3, wspace=0.2)
     
     # 1. H_res matrices for all layers (attention) - top left
     ax1 = fig.add_subplot(gs[0, 0])
-    
+
     # Stack H_res matrices horizontally
-    h_res_combined = np.hstack(data['h_res_attn'][:16])  # First 16 layers
+    split_idx = min(16, n_layers)
+    h_res_combined = np.hstack(data['h_res_attn'][:split_idx])
     im1 = ax1.imshow(h_res_combined, cmap='RdBu_r', vmin=0, vmax=0.5, aspect='auto')
-    ax1.set_title('H_res Attention (layers 0-15)\nDark blue=0, Red=0.5, White=0.25 (identity)', fontsize=10)
+    ax1.set_title(f'H_res Attention (layers 0-{split_idx-1})\nDark blue=0, Red=0.5, White=0.25 (identity)', fontsize=10)
     ax1.set_ylabel('From Stream')
     ax1.set_xlabel('To Stream (grouped by layer)')
     
     # Add layer separators
-    for i in range(1, 16):
-        ax1.axvline(x=i*4-0.5, color='black', linewidth=0.5)
+    for i in range(1, split_idx):
+        ax1.axvline(x=i * n_streams - 0.5, color='black', linewidth=0.5)
     
     plt.colorbar(im1, ax=ax1, label='Weight')
     
     # 2. H_res matrices for layers 16-27 - top right
     ax2 = fig.add_subplot(gs[0, 1])
-    h_res_combined2 = np.hstack(data['h_res_attn'][16:])
-    im2 = ax2.imshow(h_res_combined2, cmap='RdBu_r', vmin=0, vmax=0.5, aspect='auto')
-    ax2.set_title(f'H_res Attention (layers 16-{n_layers-1})', fontsize=10)
-    ax2.set_ylabel('From Stream')
-    ax2.set_xlabel('To Stream (grouped by layer)')
-    
-    for i in range(1, n_layers - 16):
-        ax2.axvline(x=i*4-0.5, color='black', linewidth=0.5)
-    
-    plt.colorbar(im2, ax=ax2, label='Weight')
+    if n_layers > split_idx:
+        h_res_combined2 = np.hstack(data['h_res_attn'][split_idx:])
+        im2 = ax2.imshow(h_res_combined2, cmap='RdBu_r', vmin=0, vmax=0.5, aspect='auto')
+        ax2.set_title(f'H_res Attention (layers {split_idx}-{n_layers-1})', fontsize=10)
+        ax2.set_ylabel('From Stream')
+        ax2.set_xlabel('To Stream (grouped by layer)')
+
+        for i in range(1, n_layers - split_idx):
+            ax2.axvline(x=i * n_streams - 0.5, color='black', linewidth=0.5)
+
+        plt.colorbar(im2, ax=ax2, label='Weight')
+    else:
+        ax2.axis('off')
     
     # 3. Alpha values across layers
     ax3 = fig.add_subplot(gs[1, :])
@@ -137,8 +168,8 @@ def plot_matplotlib(data: dict, output_path: str):
     
     # 4. H_pre weights across layers
     ax4 = fig.add_subplot(gs[2, 0])
-    h_pre = data['h_pre_attn']  # (n_layers, 4)
-    for i in range(4):
+    h_pre = data['h_pre_attn']
+    for i in range(h_pre.shape[1]):
         ax4.plot(layers, h_pre[:, i], label=f'Stream {i}', marker='o', markersize=2)
     ax4.axhline(y=0.25, color='gray', linestyle='--', alpha=0.5, label='init (0.25)')
     ax4.set_xlabel('Layer')
@@ -149,8 +180,8 @@ def plot_matplotlib(data: dict, output_path: str):
     
     # 5. H_post weights across layers
     ax5 = fig.add_subplot(gs[2, 1])
-    h_post = data['h_post_attn']  # (n_layers, 4)
-    for i in range(4):
+    h_post = data['h_post_attn']
+    for i in range(h_post.shape[1]):
         ax5.plot(layers, h_post[:, i], label=f'Stream {i}', marker='o', markersize=2)
     ax5.axhline(y=1.0, color='gray', linestyle='--', alpha=0.5, label='init (1.0)')
     ax5.set_xlabel('Layer')
@@ -201,6 +232,7 @@ def ascii_heatmap(matrix: np.ndarray, title: str = "", vmin: float = None, vmax:
 def plot_ascii(data: dict):
     """Create ASCII visualization."""
     n_layers = data['n_layers']
+    n_streams = data['h_pre_attn'].shape[1]
     
     print("\n" + "="*70)
     print("H_res MATRICES (sampled layers)")
@@ -238,11 +270,13 @@ def plot_ascii(data: dict):
     print("\n" + "="*70)
     print("H_pre WEIGHTS (squeeze: how much each stream contributes)")
     print("="*70)
-    print(f"\n{'Layer':<6} {'S0':>8} {'S1':>8} {'S2':>8} {'S3':>8}")
-    print("-" * 42)
+    header = " ".join(f"S{i:>1}".rjust(8) for i in range(n_streams))
+    print(f"\n{'Layer':<6} {header}")
+    print("-" * (7 + 1 + 9 * n_streams))
     for i in range(0, n_layers, 4):  # Every 4th layer
         w = data['h_pre_attn'][i]
-        print(f"{i:<6} {w[0]:>8.4f} {w[1]:>8.4f} {w[2]:>8.4f} {w[3]:>8.4f}")
+        vals = " ".join(f"{x:>8.4f}" for x in w)
+        print(f"{i:<6} {vals}")
 
 
 def plot_single_layer_detail(data: dict, layer_idx: int):
@@ -254,21 +288,23 @@ def plot_single_layer_detail(data: dict, layer_idx: int):
     h_res = data['h_res_attn'][layer_idx]
     h_pre = data['h_pre_attn'][layer_idx]
     h_post = data['h_post_attn'][layer_idx]
+    n_streams = h_res.shape[0]
     
     print("\n┌─────────────────────────────────────────────────────────────────┐")
-    print("│                        H_res (4×4)                              │")
+    print(f"│                        H_res ({n_streams}×{n_streams})                              │")
     print("│            Stream Mixing Matrix (doubly stochastic)            │")
     print("├─────────────────────────────────────────────────────────────────┤")
     
-    print("│         To:   S0       S1       S2       S3                    │")
+    to_streams = " ".join([f"S{i}".rjust(7) for i in range(n_streams)])
+    print(f"│         To: {to_streams}                    │")
     print("│        ┌────────────────────────────────────┐                  │")
-    for i in range(4):
+    for i in range(n_streams):
         row = " ".join(f"{v:7.4f}" for v in h_res[i])
         print(f"│  From S{i} │ {row} │                  │")
     print("│        └────────────────────────────────────┘                  │")
     
     # Identity distance
-    identity = np.eye(4)
+    identity = np.eye(n_streams)
     dist = np.abs(h_res - identity).mean()
     print(f"│  Identity distance: {dist:.4f} (0=identity, higher=mixing)       │")
     print("└─────────────────────────────────────────────────────────────────┘")
@@ -276,10 +312,10 @@ def plot_single_layer_detail(data: dict, layer_idx: int):
     print("\n┌─────────────────────────────────────────────────────────────────┐")
     print("│  H_pre (squeeze weights)      │  H_post (broadcast weights)    │")
     print("├─────────────────────────────────────────────────────────────────┤")
-    print(f"│  S0: {h_pre[0]:.4f}  (init: 0.25)   │  S0: {h_post[0]:.4f}  (init: 1.0)     │")
-    print(f"│  S1: {h_pre[1]:.4f}                 │  S1: {h_post[1]:.4f}                  │")
-    print(f"│  S2: {h_pre[2]:.4f}                 │  S2: {h_post[2]:.4f}                  │")
-    print(f"│  S3: {h_pre[3]:.4f}                 │  S3: {h_post[3]:.4f}                  │")
+    for idx in range(n_streams):
+        init_hint = "  (init: 0.25)" if idx == 0 else ""
+        init_post_hint = "  (init: 1.0)" if idx == 0 else ""
+        print(f"│  S{idx}: {h_pre[idx]:.4f}{init_hint:<15} │  S{idx}: {h_post[idx]:.4f}{init_post_hint:<16} │")
     print(f"│  Sum: {h_pre.sum():.4f}              │  Avg: {h_post.mean():.4f}               │")
     print("└─────────────────────────────────────────────────────────────────┘")
     
@@ -303,8 +339,12 @@ def main():
                         help="Show detailed view of specific layer")
     args = parser.parse_args()
     
-    print("Loading mHC model...")
-    mhc_model, tokenizer = load_mhc_model(args.mhc, device="cpu", torch_dtype=torch.float32)
+    print("Loading mHC V2 model...")
+    mhc_model, tokenizer = load_mhc_model_v2(
+        model_path=args.mhc,
+        device="cpu",
+        torch_dtype=torch.float32,
+    )
     mhc_model.eval()
     
     print(f"Collecting data from {len(mhc_model.model.layers)} layers...")

@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 import argparse
+from collections import deque
 import importlib.util
+import logging
 import math
 import os
+import re
 import shutil
 from contextlib import nullcontext
 from itertools import chain
@@ -22,11 +25,71 @@ from transformers import get_scheduler
 from datasets import load_from_disk, concatenate_datasets
 from tqdm import tqdm
 
-from src.conversionV2 import load_mhc_model_v2, convert_qwen3_to_mhc_v2
+from src.conversionV2 import load_mhc_model_v2, convert_qwen3_to_mhc_v2, count_parameters_v2
 
 
 def _has_triton() -> bool:
     return importlib.util.find_spec("triton") is not None
+
+
+def _get_underlying_model(model):
+    return model._orig_mod if hasattr(model, "_orig_mod") else model
+
+
+def _set_original_parameter_trainability(model, requires_grad: bool) -> bool:
+    base_model = _get_underlying_model(model)
+    if not hasattr(base_model, "get_original_parameters"):
+        return False
+
+    for param in base_model.get_original_parameters():
+        param.requires_grad = requires_grad
+    return True
+
+
+def _get_monitoring_stats(model):
+    base_model = _get_underlying_model(model)
+    if hasattr(base_model, "get_monitoring_stats"):
+        return base_model.get_monitoring_stats()
+    return {}
+
+
+def setup_logging(output_dir: Path, verbose: bool = False, log_file_name: str = "train.log") -> logging.Logger:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    logger = logging.getLogger("train")
+    logger.setLevel(logging.DEBUG if verbose else logging.INFO)
+    logger.propagate = False
+
+    # Rebuild handlers each run to avoid duplicate logs when re-entering main in-process.
+    logger.handlers.clear()
+
+    formatter = logging.Formatter(
+        "%(asctime)s | %(levelname)s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+    stream_handler = logging.StreamHandler()
+    stream_handler.setLevel(logging.DEBUG if verbose else logging.INFO)
+    stream_handler.setFormatter(formatter)
+
+    file_handler = logging.FileHandler(output_dir / log_file_name, encoding="utf-8")
+    file_handler.setLevel(logging.DEBUG)
+    file_handler.setFormatter(formatter)
+
+    logger.addHandler(stream_handler)
+    logger.addHandler(file_handler)
+
+    return logger
+
+
+def _get_gpu_memory_stats(device: torch.device) -> dict:
+    if device.type != "cuda" or not torch.cuda.is_available():
+        return {}
+
+    return {
+        "alloc_gb": torch.cuda.memory_allocated(device) / 1e9,
+        "reserved_gb": torch.cuda.memory_reserved(device) / 1e9,
+        "max_alloc_gb": torch.cuda.max_memory_allocated(device) / 1e9,
+    }
 
 # =========================
 # 🔥 CUDA OPTIMIZATION
@@ -71,10 +134,24 @@ def collate_pretokenized_batch(batch):
 def find_latest_checkpoint(output_dir: Path) -> Optional[Path]:
     if not output_dir.exists():
         return None
-    candidates = [d for d in output_dir.iterdir() if d.is_dir() and d.name.startswith('checkpoint-')]
+
+    def checkpoint_step(path: Path) -> Optional[int]:
+        match = re.fullmatch(r"checkpoint-(\d+)", path.name)
+        if match is None:
+            return None
+        return int(match.group(1))
+
+    candidates = []
+    for d in output_dir.iterdir():
+        if not d.is_dir():
+            continue
+        if checkpoint_step(d) is None:
+            continue
+        candidates.append(d)
+
     if not candidates:
         return None
-    return max(candidates, key=lambda p: int(p.name.split('-')[-1]))
+    return max(candidates, key=lambda p: checkpoint_step(p) or -1)
 
 
 def save_checkpoint(output_dir, model, tokenizer, optimizer, scheduler, global_step, step_times):
@@ -122,8 +199,15 @@ def compute_loss(outputs, batch):
 # =========================
 # DATA LOADING
 # =========================
-def load_data(path):
+def load_data(path, logger: Optional[logging.Logger] = None):
     train_path = Path(path) / "train"
+
+    def _log(level: str, msg: str):
+        if logger is None:
+            print(msg)
+            return
+        getattr(logger, level)(msg)
+
     if train_path.exists():
         train_ds = load_from_disk(str(train_path))
         val_path = Path(path) / "validation"
@@ -144,7 +228,8 @@ def load_data(path):
                 skipped_shards.append(shard.name)
 
         if skipped_shards:
-            print(
+            _log(
+                "warning",
                 f"Skipping {len(skipped_shards)} invalid shard directories: "
                 + ", ".join(skipped_shards)
             )
@@ -174,12 +259,15 @@ def main():
     parser.add_argument('--n-streams', type=int, default=2)
     parser.add_argument('--num-fracs', type=int, default=1)
     parser.add_argument('--sinkhorn-iters', type=int, default=5)
+    parser.add_argument('--residual-mix-temperature', type=float, default=1.0)
 
     parser.add_argument('--output-dir', required=True)
 
     parser.add_argument('--batch-size', type=int, default=1)
     parser.add_argument('--gradient-accumulation-steps', type=int, default=8)
     parser.add_argument('--total-steps', type=int, default=50000)
+    parser.add_argument('--freeze-original-steps', type=int, default=500,
+                        help='Freeze non-mHC backbone parameters for the first N optimizer steps.')
 
     parser.add_argument('--learning-rate', type=float, default=1e-4)
     parser.add_argument('--weight-decay', type=float, default=0.01)
@@ -210,24 +298,38 @@ def main():
                         help="Use fused AdamW when supported by this PyTorch/CUDA build.")
     parser.add_argument('--no-gradient-checkpointing', action='store_true',
                         help="Disable gradient checkpointing (faster, but higher VRAM use).")
+    parser.add_argument('--log-interval', type=int, default=100,
+                        help="Log optimizer-step metrics every N steps.")
+    parser.add_argument('--verbose', action='store_true',
+                        help="Enable debug-level logging.")
+    parser.add_argument('--log-file', type=str, default='train.log',
+                        help="Log file name under output-dir.")
 
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    logger = setup_logging(output_dir, verbose=args.verbose, log_file_name=args.log_file)
+    logger.info("Starting training run")
+    logger.info(f"Workspace output directory: {output_dir}")
+    logger.info(f"Device selected: {device}")
+    logger.info(f"PyTorch version: {torch.__version__}")
+
+    if device.type == "cuda":
+        logger.info(f"CUDA device: {torch.cuda.get_device_name(device)}")
 
     if args.dtype == 'auto':
         if device.type == 'cuda' and torch.cuda.is_bf16_supported():
             model_dtype = torch.bfloat16
             amp_dtype = torch.bfloat16
             use_grad_scaler = False
-            print("AMP dtype auto-selected: bf16")
+            logger.info("AMP dtype auto-selected: bf16")
         else:
             model_dtype = torch.float16
             amp_dtype = torch.float16
             use_grad_scaler = (device.type == 'cuda')
-            print("AMP dtype auto-selected: fp16")
+            logger.info("AMP dtype auto-selected: fp16")
     elif args.dtype == 'bf16':
         model_dtype = torch.bfloat16
         amp_dtype = torch.bfloat16
@@ -237,7 +339,15 @@ def main():
         amp_dtype = torch.float16
         use_grad_scaler = (device.type == 'cuda')
 
-    train_ds, val_ds = load_data(args.tokenized_dir)
+    logger.info(
+        "Training args: "
+        f"batch_size={args.batch_size}, grad_accum={args.gradient_accumulation_steps}, "
+        f"total_steps={args.total_steps}, lr={args.learning_rate:.2e}, warmup={args.warmup_steps}, "
+        f"save_steps={args.save_steps}, workers={args.num_workers}, compile={args.use_compile}, "
+        f"dtype={args.dtype}, scaler_enabled={use_grad_scaler}, freeze_original_steps={args.freeze_original_steps}"
+    )
+
+    train_ds, val_ds = load_data(args.tokenized_dir, logger=logger)
     train_ds.set_format(type='torch')
 
     loader_kwargs = {
@@ -252,13 +362,18 @@ def main():
         loader_kwargs['prefetch_factor'] = args.prefetch_factor
 
     loader = DataLoader(train_ds, **loader_kwargs)
+    logger.info(
+        f"Dataset loaded: train_examples={len(train_ds)}, "
+        f"val_examples={(len(val_ds) if val_ds is not None else 0)}, "
+        f"batches_per_epoch={len(loader)}"
+    )
 
     checkpoint_to_resume = None
     if args.resume_from_checkpoint:
         if args.resume_from_checkpoint.lower() == "latest":
             checkpoint_to_resume = find_latest_checkpoint(output_dir)
             if checkpoint_to_resume is None:
-                print("No checkpoint-* found under output-dir; starting fresh.")
+                logger.info("No checkpoint-* found under output-dir; starting fresh.")
         else:
             checkpoint_to_resume = Path(args.resume_from_checkpoint)
             if not checkpoint_to_resume.exists():
@@ -266,7 +381,7 @@ def main():
     elif not args.no_resume:
         checkpoint_to_resume = find_latest_checkpoint(output_dir)
         if checkpoint_to_resume is not None:
-            print(f"Auto-resuming from latest checkpoint: {checkpoint_to_resume}")
+            logger.info(f"Auto-resuming from latest checkpoint: {checkpoint_to_resume}")
 
     # =========================
     # MODEL
@@ -295,6 +410,7 @@ def main():
             n_streams=args.n_streams,
             num_fracs=args.num_fracs,
             sinkhorn_iters=args.sinkhorn_iters,
+            residual_mix_temperature=args.residual_mix_temperature,
             device="cuda" if device.type == "cuda" else "cpu",
             torch_dtype=model_dtype,
             trust_remote_code=False,
@@ -306,13 +422,31 @@ def main():
     if hasattr(model, "config"):
         model.config.use_cache = False
 
+    original_parameters_frozen = False
+    if args.freeze_original_steps > 0:
+        if _set_original_parameter_trainability(model, False):
+            original_parameters_frozen = True
+            logger.info(
+                f"Stage 1 active: froze original parameters for first {args.freeze_original_steps} optimizer steps"
+            )
+
     model.to(device)
+
+    try:
+        param_counts = count_parameters_v2(model)
+        logger.info(
+            f"Model parameters: total={param_counts['total']:,}, "
+            f"original={param_counts['original']:,}, mhc={param_counts['mhc']:,} "
+            f"({param_counts['mhc_percentage']:.2f}%)"
+        )
+    except Exception as exc:
+        logger.warning(f"Could not compute parameter breakdown: {exc}")
 
     compiled_model_active = False
     if args.use_compile and hasattr(torch, "compile"):
         try:
             if not _has_triton():
-                print("torch.compile requested but Triton is unavailable; continuing in eager mode.")
+                logger.warning("torch.compile requested but Triton is unavailable; continuing in eager mode.")
             else:
                 # Reduce extra private-pool pressure from CUDA graph capture on smaller GPUs.
                 os.environ.setdefault("TORCHINDUCTOR_CUDAGRAPHS", "0")
@@ -320,17 +454,17 @@ def main():
                 dynamo.config.suppress_errors = True
                 model = torch.compile(model, mode=args.compile_mode)
                 compiled_model_active = True
-                print(f"torch.compile enabled with mode={args.compile_mode}")
+                logger.info(f"torch.compile enabled with mode={args.compile_mode}")
         except Exception as e:
-            print(f"torch.compile failed, continuing without compile: {e}")
+            logger.warning(f"torch.compile failed, continuing without compile: {e}")
 
     if args.use_fused_adamw:
         try:
             optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, fused=True)
-            print("Using fused AdamW")
+            logger.info("Using fused AdamW")
         except TypeError:
             optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate)
-            print("Fused AdamW unsupported in this build; using standard AdamW")
+            logger.warning("Fused AdamW unsupported in this build; using standard AdamW")
     else:
         optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate)
     scheduler = get_scheduler(
@@ -360,11 +494,18 @@ def main():
                 scaler.load_state_dict(state["scaler"])
 
             step_times = state.get("step_times", [])
-            print(f"Resumed optimizer/scheduler state from {training_state_path} at global_step={global_step}")
+            logger.info(f"Resumed optimizer/scheduler state from {training_state_path} at global_step={global_step}")
         else:
-            print(f"Checkpoint found at {checkpoint_to_resume} but no training_state.pt; resuming weights only.")
+            logger.warning(f"Checkpoint found at {checkpoint_to_resume} but no training_state.pt; resuming weights only.")
 
     pbar = tqdm(total=args.total_steps, initial=global_step)
+    recent_losses = deque(maxlen=50)
+    recent_step_times = deque(maxlen=50)
+    train_start_time = time.perf_counter()
+    accumulated_micro_loss = 0.0
+    micro_batch_count = 0
+
+    logger.info("Entering training loop")
 
     while global_step < args.total_steps:
         for step, batch in enumerate(loader):
@@ -379,17 +520,21 @@ def main():
                         or "BackendCompilerFailed" in e.__class__.__name__
                         or "backend='inductor' raised" in str(e)
                     ):
-                        print("torch.compile backend failed at runtime; falling back to eager model.")
+                        logger.warning("torch.compile backend failed at runtime; falling back to eager model.")
                         if hasattr(model, "_orig_mod"):
                             model = model._orig_mod
                         compiled_model_active = False
                         outputs = model(**batch)
                     else:
                         raise
-                loss = compute_loss(outputs, batch)
-                loss = loss / args.gradient_accumulation_steps
+                raw_loss = compute_loss(outputs, batch)
+                loss = raw_loss / args.gradient_accumulation_steps
+
+            accumulated_micro_loss += float(raw_loss.item())
+            micro_batch_count += 1
 
             if torch.isnan(loss):
+                logger.warning(f"NaN loss encountered at micro-step {step} (global_step={global_step}); skipping.")
                 continue
 
             try:
@@ -398,28 +543,86 @@ def main():
                 optimizer.zero_grad(set_to_none=True)
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
+                logger.exception("CUDA OOM during backward pass")
                 raise RuntimeError(
                     "CUDA OOM during backward pass. Resume now works, but this run still exceeds VRAM. "
                     "Try --batch-size 1, keep gradient accumulation the same, and prefer --dtype bf16 if supported."
                 )
 
             if (step + 1) % args.gradient_accumulation_steps == 0:
+                optimizer_step_start = time.perf_counter()
                 scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
 
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad(set_to_none=True)
                 scheduler.step()
 
+                optimizer_step_time = time.perf_counter() - optimizer_step_start
+                step_times.append(optimizer_step_time)
+                recent_step_times.append(optimizer_step_time)
+
+                mean_loss = accumulated_micro_loss / max(1, micro_batch_count)
+                recent_losses.append(mean_loss)
+                accumulated_micro_loss = 0.0
+                micro_batch_count = 0
+
                 global_step += 1
                 pbar.update(1)
 
-                if global_step % 100 == 0:
-                    mem = torch.cuda.memory_allocated() / 1e9
-                    print(f"Step {global_step} | Loss {loss.item():.4f} | GPU {mem:.2f} GB")
+                if original_parameters_frozen and global_step >= args.freeze_original_steps:
+                    if _set_original_parameter_trainability(model, True):
+                        original_parameters_frozen = False
+                        logger.info(f"Stage 2 active: unfroze original parameters at step {global_step}")
+
+                if global_step % args.log_interval == 0:
+                    lr = optimizer.param_groups[0]["lr"]
+                    avg_loss = sum(recent_losses) / len(recent_losses) if recent_losses else mean_loss
+                    avg_step_time = sum(recent_step_times) / len(recent_step_times) if recent_step_times else optimizer_step_time
+                    grad_norm_value = float(grad_norm.item()) if torch.is_tensor(grad_norm) else float(grad_norm)
+
+                    seq_len = int(batch["input_ids"].shape[1])
+                    effective_batch = args.batch_size * args.gradient_accumulation_steps
+                    tokens_per_step = effective_batch * seq_len
+                    tokens_per_sec = (tokens_per_step / avg_step_time) if avg_step_time > 0 else float("inf")
+                    samples_per_sec = (effective_batch / avg_step_time) if avg_step_time > 0 else float("inf")
+
+                    elapsed = time.perf_counter() - train_start_time
+                    remaining_steps = max(0, args.total_steps - global_step)
+                    eta_seconds = remaining_steps * avg_step_time
+
+                    mem_stats = _get_gpu_memory_stats(device)
+                    monitoring_stats = _get_monitoring_stats(model)
+                    entropy = monitoring_stats.get("h_res_entropy_mean")
+                    identity_dist = monitoring_stats.get("h_res_identity_distance_mean")
+
+                    log_msg = (
+                        f"step={global_step}/{args.total_steps} "
+                        f"loss={mean_loss:.4f} avg_loss={avg_loss:.4f} lr={lr:.3e} grad_norm={grad_norm_value:.3f} "
+                        f"step_time={optimizer_step_time:.3f}s avg_step_time={avg_step_time:.3f}s "
+                        f"tokens/s={tokens_per_sec:.1f} samples/s={samples_per_sec:.2f} "
+                        f"elapsed={elapsed/60.0:.1f}m eta={eta_seconds/60.0:.1f}m "
+                        f"phase={'frozen' if original_parameters_frozen else 'unfrozen'}"
+                    )
+
+                    if mem_stats:
+                        log_msg += (
+                            f" gpu_alloc={mem_stats['alloc_gb']:.2f}GB"
+                            f" gpu_reserved={mem_stats['reserved_gb']:.2f}GB"
+                            f" gpu_max_alloc={mem_stats['max_alloc_gb']:.2f}GB"
+                        )
+
+                    if entropy is not None:
+                        log_msg += f" h_res_entropy={entropy:.4f}"
+                    if identity_dist is not None:
+                        log_msg += f" h_res_identity_dist={identity_dist:.4f}"
+
+                    logger.info(log_msg)
+                    pbar.set_postfix({"loss": f"{mean_loss:.4f}", "lr": f"{lr:.2e}"})
 
                 if global_step % args.save_steps == 0:
+                    save_start = time.perf_counter()
                     ckpt = save_checkpoint(output_dir, model, tokenizer, optimizer, scheduler, global_step, step_times)
                     # Persist scaler state for exact AMP resume.
                     state_path = ckpt / "training_state.pt"
@@ -427,6 +630,8 @@ def main():
                     state["scaler"] = scaler.state_dict() if use_grad_scaler else None
                     torch.save(state, state_path)
                     prune_old_checkpoints(output_dir, args.keep_last_checkpoints)
+                    save_dur = time.perf_counter() - save_start
+                    logger.info(f"Checkpoint saved: {ckpt} (save_time={save_dur:.2f}s)")
 
                 if global_step >= args.total_steps:
                     break
@@ -435,7 +640,12 @@ def main():
             break
 
     pbar.close()
-    print("Training complete")
+    total_time = time.perf_counter() - train_start_time
+    avg_step_time = (sum(step_times) / len(step_times)) if step_times else 0.0
+    logger.info(
+        f"Training complete: global_step={global_step}, total_time={total_time/60.0:.2f}m, "
+        f"avg_optimizer_step_time={avg_step_time:.3f}s"
+    )
 
 
 if __name__ == "__main__":

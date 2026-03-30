@@ -167,6 +167,10 @@ class MHCV2Trainer:
         
         # Setup scheduler
         self.scheduler = StepLRScheduler(self.optimizer, config)
+
+        self.freeze_original_steps = max(0, int(getattr(self.config, "freeze_original_steps", 0)))
+        self.original_parameters_frozen = False
+        self._maybe_freeze_original_parameters()
         
         # Tracking
         self.global_step = 0
@@ -181,6 +185,46 @@ class MHCV2Trainer:
         self.logger.info(f"Tokens per optimizer step: {tokens_per_step:,}")
         self.logger.info(f"DataLoader workers: {self.config.num_workers}")
         self._log_compile_status()
+
+    def _get_model_for_introspection(self) -> nn.Module:
+        """Return the underlying model when torch.compile wraps it."""
+        return self.model._orig_mod if hasattr(self.model, "_orig_mod") else self.model
+
+    def _set_original_parameter_trainability(self, requires_grad: bool) -> bool:
+        """Set requires_grad on original (non-mHC) parameters when available."""
+        model_for_introspection = self._get_model_for_introspection()
+
+        if not hasattr(model_for_introspection, "get_original_parameters"):
+            return False
+
+        original_parameters = model_for_introspection.get_original_parameters()
+        for param in original_parameters:
+            param.requires_grad = requires_grad
+
+        return len(original_parameters) > 0
+
+    def _maybe_freeze_original_parameters(self):
+        """Stage 1: freeze original backbone for early mHC stabilization."""
+        if self.freeze_original_steps <= 0:
+            return
+
+        if self._set_original_parameter_trainability(False):
+            self.original_parameters_frozen = True
+            self.logger.info(
+                f"Stage 1 active: frozen original parameters for first {self.freeze_original_steps} optimizer steps"
+            )
+
+    def _maybe_unfreeze_original_parameters(self):
+        """Stage 2: unfreeze original backbone after initial mHC-only adaptation."""
+        if not self.original_parameters_frozen:
+            return
+
+        if self.global_step < self.freeze_original_steps:
+            return
+
+        if self._set_original_parameter_trainability(True):
+            self.original_parameters_frozen = False
+            self.logger.info(f"Stage 2 active: unfroze original parameters at step {self.global_step}")
 
     def _configure_runtime_performance(self):
         """Apply CPU/GPU runtime knobs from config."""
@@ -283,8 +327,6 @@ class MHCV2Trainer:
         no_decay_params = []
 
         for name, param in self.model.named_parameters():
-            if not param.requires_grad:
-                continue
             lowered = name.lower()
             if "bias" in lowered or "norm" in lowered:
                 no_decay_params.append(param)
@@ -350,6 +392,7 @@ class MHCV2Trainer:
 
                 grad_norm = self._optimizer_step()
                 self.global_step += 1
+                self._maybe_unfreeze_original_parameters()
 
                 # Logging
                 if self.global_step % self.config.log_interval == 0:
@@ -434,8 +477,24 @@ class MHCV2Trainer:
         """Log training metrics."""
         lr = self.optimizer.param_groups[0]['lr']
 
+        model_for_introspection = self._get_model_for_introspection()
+        monitoring_stats = (
+            model_for_introspection.get_monitoring_stats()
+            if hasattr(model_for_introspection, "get_monitoring_stats")
+            else {}
+        )
+
+        entropy_mean = monitoring_stats.get("h_res_entropy_mean")
+        identity_dist_mean = monitoring_stats.get("h_res_identity_distance_mean")
+
+        extra_stats = ""
+        if entropy_mean is not None:
+            extra_stats += f", h_res_entropy={entropy_mean:.4f}"
+        if identity_dist_mean is not None:
+            extra_stats += f", h_res_identity_dist={identity_dist_mean:.4f}"
+
         self.logger.info(
-            f"Step {self.global_step}: loss={loss:.4f}, lr={lr:.2e}, grad_norm={grad_norm:.2f}"
+            f"Step {self.global_step}: loss={loss:.4f}, lr={lr:.2e}, grad_norm={grad_norm:.2f}{extra_stats}"
         )
     
     def _evaluate(self):
@@ -512,6 +571,9 @@ class MHCV2Trainer:
         self.global_step = int(state.get("global_step", 0))
         self.best_loss = float(state.get("best_loss", float("inf")))
         self.loss_history = deque(state.get("loss_history", []), maxlen=100)
+
+        # Ensure staged training state is coherent when resuming mid-run.
+        self._maybe_unfreeze_original_parameters()
 
         self.logger.info(f"Resumed trainer state from {checkpoint_dir} (step {self.global_step})")
 
@@ -769,12 +831,18 @@ def main():
         n_streams = model_config.get('n_streams', 4)
         num_fracs = model_config.get('num_fracs', 1)
         sinkhorn_iters = model_config.get('sinkhorn_iters', 20)
+        add_stream_embed = model_config.get('add_stream_embed', True)
+        add_attn_pool_reduce_stream = model_config.get('add_attn_pool_reduce_stream', False)
+        residual_mix_temperature = model_config.get('residual_mix_temperature', 1.0)
         
         model, tokenizer = convert_qwen3_to_mhc_v2(
             model_name_or_path=args.base_model,
             n_streams=n_streams,
             num_fracs=num_fracs,
             sinkhorn_iters=sinkhorn_iters,
+            add_stream_embed=add_stream_embed,
+            add_attn_pool_reduce_stream=add_attn_pool_reduce_stream,
+            residual_mix_temperature=residual_mix_temperature,
             device=args.device,
             validate=True,
             validation_tolerance=1.0,  # Relaxed tolerance for V2

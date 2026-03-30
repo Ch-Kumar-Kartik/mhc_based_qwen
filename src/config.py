@@ -121,6 +121,7 @@ class MHCTrainingConfig:
     sequence_length: int = 4096
     gradient_accumulation_steps: int = 1
     max_grad_norm: float = 1.0
+    freeze_original_steps: int = 0
 
     # Precision / performance
     amp_dtype: str = "bfloat16"  # bfloat16, float16, or float32

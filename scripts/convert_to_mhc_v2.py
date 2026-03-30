@@ -59,6 +59,41 @@ def main():
         default=20,
         help="Number of Sinkhorn iterations",
     )
+
+    parser.add_argument(
+        "--add-stream-embed",
+        action="store_true",
+        default=True,
+        help="Enable learned stream embeddings during stream expansion",
+    )
+
+    parser.add_argument(
+        "--no-add-stream-embed",
+        dest="add_stream_embed",
+        action="store_false",
+        help="Disable learned stream embeddings during stream expansion",
+    )
+
+    parser.add_argument(
+        "--add-attn-pool-reduce-stream",
+        action="store_true",
+        default=False,
+        help="Use attention pooling for stream reduction",
+    )
+
+    parser.add_argument(
+        "--no-add-attn-pool-reduce-stream",
+        dest="add_attn_pool_reduce_stream",
+        action="store_false",
+        help="Disable attention pooling and use standard stream reduction",
+    )
+
+    parser.add_argument(
+        "--residual-mix-temperature",
+        type=float,
+        default=1.0,
+        help="Temperature for residual Sinkhorn logits (smaller is sharper)",
+    )
     
     parser.add_argument(
         "--device",
@@ -109,6 +144,9 @@ def main():
     logger.info(f"  n_streams: {args.n_streams}")
     logger.info(f"  num_fracs: {args.num_fracs}")
     logger.info(f"  sinkhorn_iters: {args.sinkhorn_iters}")
+    logger.info(f"  add_stream_embed: {args.add_stream_embed}")
+    logger.info(f"  add_attn_pool_reduce_stream: {args.add_attn_pool_reduce_stream}")
+    logger.info(f"  residual_mix_temperature: {args.residual_mix_temperature}")
     logger.info(f"  device: {args.device}")
     logger.info(f"  dtype: {args.dtype}")
     
@@ -118,6 +156,9 @@ def main():
         n_streams=args.n_streams,
         num_fracs=args.num_fracs,
         sinkhorn_iters=args.sinkhorn_iters,
+        add_stream_embed=args.add_stream_embed,
+        add_attn_pool_reduce_stream=args.add_attn_pool_reduce_stream,
+        residual_mix_temperature=args.residual_mix_temperature,
         output_path=args.output,
         device=args.device,
         torch_dtype=torch_dtype,

@@ -6,6 +6,9 @@ model:
   n_streams: 4
   num_fracs: 1  # Frac-connections parameter (1 = standard mHC)
   sinkhorn_iters: 20
+  add_stream_embed: true
+  add_attn_pool_reduce_stream: false
+  residual_mix_temperature: 1.0
   log_domain_sinkhorn: false
   dtype: "bfloat16"
 
@@ -29,6 +32,7 @@ training:
   sequence_length: 256
   gradient_accumulation_steps: 4
   max_grad_norm: 1.0
+  freeze_original_steps: 500
 
   # Precision / speed
   amp_dtype: "bfloat16"

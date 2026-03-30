@@ -29,3 +29,5 @@ train.out.log
 train.err.log.*
 train.out.log.*
 train.log*
+train.err*
+train.out*

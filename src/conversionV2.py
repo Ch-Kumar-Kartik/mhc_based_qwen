@@ -23,11 +23,32 @@ from .qwen3_mhc_modelV2 import Qwen3MHCConfigV2, Qwen3MHCForCausalLMV2, Qwen3MHC
 logger = logging.getLogger(__name__)
 
 
+def register_mhc_v2_auto_classes() -> None:
+    """Register mHC V2 config/model with Transformers auto classes.
+
+    This is safe to call multiple times in one process.
+    """
+    try:
+        AutoConfig.register("qwen3_mhc_v2", Qwen3MHCConfigV2)
+    except ValueError:
+        # Already registered in this Python process.
+        pass
+
+    try:
+        AutoModelForCausalLM.register(Qwen3MHCConfigV2, Qwen3MHCForCausalLMV2)
+    except ValueError:
+        # Already registered in this Python process.
+        pass
+
+
 def convert_qwen3_to_mhc_v2(
     model_name_or_path: str = "Qwen/Qwen3-0.6B",
     n_streams: int = 4,
     num_fracs: int = 1,
     sinkhorn_iters: int = 20,
+    add_stream_embed: bool = True,
+    add_attn_pool_reduce_stream: bool = True,
+    residual_mix_temperature: float = 1.0,
     output_path: Optional[str] = None,
     device: str = "cuda",
     torch_dtype: torch.dtype = torch.bfloat16,
@@ -50,6 +71,9 @@ def convert_qwen3_to_mhc_v2(
         n_streams: Number of parallel streams for mHC (default 4).
         num_fracs: Number of fractions for frac-connections (default 1).
         sinkhorn_iters: Number of Sinkhorn iterations (default 20).
+        add_stream_embed: Whether to add stream embeddings at expansion.
+        add_attn_pool_reduce_stream: Whether to use attention pooling for stream reduction.
+        residual_mix_temperature: Temperature for residual Sinkhorn logits.
         output_path: Optional path to save converted model.
         device: Device to load models on.
         torch_dtype: Data type for model weights.
@@ -91,6 +115,9 @@ def convert_qwen3_to_mhc_v2(
         n_streams=n_streams,
         num_fracs=num_fracs,
         sinkhorn_iters=sinkhorn_iters,
+        add_stream_embed=add_stream_embed,
+        add_attn_pool_reduce_stream=add_attn_pool_reduce_stream,
+        residual_mix_temperature=residual_mix_temperature,
     )
     
     logger.info(f"Creating mHC V2 model with {n_streams} streams, {num_fracs} fracs")
@@ -139,6 +166,9 @@ def create_mhc_config_v2_from_qwen3(
     n_streams: int = 4,
     num_fracs: int = 1,
     sinkhorn_iters: int = 20,
+    add_stream_embed: bool = True,
+    add_attn_pool_reduce_stream: bool = True,
+    residual_mix_temperature: float = 1.0,
 ) -> Qwen3MHCConfigV2:
     """Create Qwen3MHCConfigV2 from original Qwen3 config.
     
@@ -180,8 +210,9 @@ def create_mhc_config_v2_from_qwen3(
         num_dynamic_alpha_proposals=1,
         mhc_dropout=0.0,
         use_triton_sinkhorn=False,
-        add_stream_embed=False,
-        add_attn_pool_reduce_stream=False,
+        add_stream_embed=add_stream_embed,
+        add_attn_pool_reduce_stream=add_attn_pool_reduce_stream,
+        residual_mix_temperature=residual_mix_temperature,
     )
     
     # Force eager attention for mHC model
@@ -399,6 +430,9 @@ def load_mhc_model_v2(
     Returns:
         Tuple of (model, tokenizer).
     """
+    # Ensure Transformers knows how to resolve this custom config/model type.
+    register_mhc_v2_auto_classes()
+
     # Check if model_path is a local directory and fail fast on common bad paths.
     model_path_obj = Path(model_path).expanduser().resolve()
     is_local = model_path_obj.exists() and model_path_obj.is_dir()

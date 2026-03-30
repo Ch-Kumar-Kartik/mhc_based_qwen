@@ -71,8 +71,9 @@ class Qwen3MHCConfigV2(PretrainedConfig):
         num_dynamic_alpha_proposals: int = 1,
         mhc_dropout: float = 0.0,
         use_triton_sinkhorn: bool = False,
-        add_stream_embed: bool = False,
+        add_stream_embed: bool = True,
         add_attn_pool_reduce_stream: bool = False,
+        residual_mix_temperature: float = 1.0,
         **kwargs,
     ):
         super().__init__(
@@ -134,6 +135,7 @@ class Qwen3MHCConfigV2(PretrainedConfig):
         self.use_triton_sinkhorn = use_triton_sinkhorn
         self.add_stream_embed = add_stream_embed
         self.add_attn_pool_reduce_stream = add_attn_pool_reduce_stream
+        self.residual_mix_temperature = residual_mix_temperature
 
 
 class Qwen3MHCDecoderLayerV2(nn.Module):
@@ -191,6 +193,7 @@ class Qwen3MHCDecoderLayerV2(nn.Module):
             num_input_views=config.num_input_views,
             num_dynamic_alpha_proposals=config.num_dynamic_alpha_proposals,
             use_triton_sinkhorn=config.use_triton_sinkhorn,
+            residual_mix_temperature=config.residual_mix_temperature,
         )
         
         self.mhc_mlp = ManifoldConstrainedHyperConnectionsV2(
@@ -204,6 +207,7 @@ class Qwen3MHCDecoderLayerV2(nn.Module):
             num_input_views=config.num_input_views,
             num_dynamic_alpha_proposals=config.num_dynamic_alpha_proposals,
             use_triton_sinkhorn=config.use_triton_sinkhorn,
+            residual_mix_temperature=config.residual_mix_temperature,
         )
     
     def forward(
@@ -478,6 +482,7 @@ class Qwen3MHCForCausalLMV2(PreTrainedModel, GenerationMixin):
     
     config_class = Qwen3MHCConfigV2
     base_model_prefix = "model"
+    _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
     _supports_param_buffer_assignment = False  # Prevent post_init from reinitializing MHC params
     supports_gradient_checkpointing = True
     
@@ -513,6 +518,10 @@ class Qwen3MHCForCausalLMV2(PreTrainedModel, GenerationMixin):
         
         # Initialize weights
         self.post_init()
+
+        # Keep output projection aligned with token embeddings when enabled.
+        if self.config.tie_word_embeddings:
+            self.lm_head.weight = self.model.embed_tokens.weight
     
     def get_input_embeddings(self):
         return self.model.embed_tokens
@@ -669,11 +678,27 @@ class Qwen3MHCForCausalLMV2(PreTrainedModel, GenerationMixin):
         mhc_param_ids = {id(p) for p in self.get_mhc_parameters()}
         return [p for p in self.parameters() if id(p) not in mhc_param_ids]
     
-    def get_monitoring_stats(self, hidden_states: torch.Tensor) -> dict:
+    def get_monitoring_stats(self) -> dict:
         """Get monitoring statistics from all mHC V2 layers."""
+        entropies = []
+        identity_distances = []
+
+        for layer in self.model.layers:
+            for mhc in (layer.mhc_attn, layer.mhc_mlp):
+                if mhc.last_h_res_entropy is not None:
+                    entropies.append(mhc.last_h_res_entropy)
+                if mhc.last_h_res_identity_distance is not None:
+                    identity_distances.append(mhc.last_h_res_identity_distance)
+
         stats = {
             "n_streams": self.config.n_streams,
             "num_fracs": self.config.num_fracs,
             "sinkhorn_iters": self.config.sinkhorn_iters,
         }
+
+        if entropies:
+            stats["h_res_entropy_mean"] = sum(entropies) / len(entropies)
+        if identity_distances:
+            stats["h_res_identity_distance_mean"] = sum(identity_distances) / len(identity_distances)
+
         return stats

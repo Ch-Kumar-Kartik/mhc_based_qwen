@@ -9,6 +9,7 @@ from torch import nn, cat
 import torch.nn.functional as F
 from torch.nn import Module, Sequential
 from torch.utils._pytree import tree_flatten, tree_unflatten
+from transformers.models.qwen3.modeling_qwen3 import Qwen3RMSNorm
 
 from einops import rearrange, repeat, reduce, einsum
 from einops.layers.torch import Rearrange, Reduce
@@ -105,7 +106,7 @@ def get_expand_reduce_stream_functions(
     if add_attn_pool_reduce_stream:
         reduce_fn = AttentionPoolReduceStream(dim)
     else:
-        reduce_fn = Reduce('... s d -> ... d', 'sum')
+        reduce_fn = Reduce('... s d -> ... d', 'mean')
 
     return expand_fn, reduce_fn
 
@@ -144,11 +145,10 @@ def get_init_and_expand_reduce_stream_functions(
 class RMSNorm(Module):
     def __init__(self, dim):
         super().__init__()
-        self.scale = dim ** 0.5
-        self.gamma = nn.Parameter(torch.zeros(dim))
+        self.norm = Qwen3RMSNorm(dim, eps = 1e-6)
 
     def forward(self, x):
-        return F.normalize(x, dim = -1) * self.scale * (self.gamma + 1)
+        return self.norm(x)
 
 # main classes
 
@@ -257,6 +257,7 @@ class ManifoldConstrainedHyperConnectionsV2(Module):
         forward_method_names: tuple[str, ...] = (),
         num_dynamic_alpha_proposals = 1,
         use_triton_sinkhorn = False,
+        residual_mix_temperature = 1.0,
     ):
         super().__init__()
 
@@ -309,21 +310,22 @@ class ManifoldConstrainedHyperConnectionsV2(Module):
 
         self.static_alpha = nn.Parameter(cat((init_alpha0, torch.eye(num_residual_streams_fracs)), dim = 1))
 
-        self.dynamic_alpha_fn = nn.Parameter(torch.zeros(num_dynamic_alpha_proposals, dim, num_residual_streams_fracs + num_input_views_fracs))
-
-        self.pre_branch_scale = nn.Parameter(torch.ones(1) * 1e-2)
-        self.residual_scale = nn.Parameter(torch.ones(1) * 1e-2)
+        self.dynamic_alpha_fn = nn.Parameter(
+            torch.zeros(num_dynamic_alpha_proposals, dim, num_residual_streams_fracs + num_input_views_fracs)
+        )
+        self.pre_branch_scale = nn.Parameter(torch.zeros(1))
+        self.residual_scale = nn.Parameter(torch.zeros(1))
 
         # depth connection related (beta)
 
         self.add_branch_out_to_residual = add_branch_out_to_residual
 
         if add_branch_out_to_residual:
-            self.static_beta = nn.Parameter(torch.ones(num_residual_streams, num_fracs, 1))
+            self.static_beta = nn.Parameter(torch.zeros(num_residual_streams, num_fracs, 1))
 
             self.dynamic_beta_fn = nn.Parameter(torch.zeros(dim, num_fracs))
 
-            self.h_post_scale = nn.Parameter(torch.ones(()) * 1e-2)
+            self.h_post_scale = nn.Parameter(torch.zeros(()))
 
         # Hres constraint related
         # by default is sinkhorn
@@ -344,6 +346,13 @@ class ManifoldConstrainedHyperConnectionsV2(Module):
                 residual_mix_constraint_fn,
                 partial(sinkhorn_knopps if not log_domain_sinkhorn else log_domain_sinkhorn_knopps, iters = sinkhorn_iters)
             )
+
+        if residual_mix_temperature <= 0:
+            raise ValueError('`residual_mix_temperature` must be > 0')
+        self.residual_mix_temperature = residual_mix_temperature
+
+        self.last_h_res_entropy = None
+        self.last_h_res_identity_distance = None
 
         # dropouts
 
@@ -410,8 +419,10 @@ class ManifoldConstrainedHyperConnectionsV2(Module):
 
         alpha_pre, alpha_residual = alpha[..., :self.num_input_views * self.num_fracs], alpha[..., self.num_input_views * self.num_fracs:]
 
-        alpha_pre = alpha_pre.sigmoid()
-
+        alpha_pre = alpha_pre.softmax(dim = -1)
+        
+        alpha_residual = alpha_residual / self.residual_mix_temperature
+        alpha_residual = torch.clamp(alpha_residual, -5.0, 5.0)
         alpha_residual = self.residual_mix_constraint_fn(alpha_residual)
 
         alpha = cat((alpha_pre, alpha_residual), dim = -1)
@@ -420,6 +431,22 @@ class ManifoldConstrainedHyperConnectionsV2(Module):
             alpha = reduce(alpha, 'p ... -> ...', 'mean')
         else:
             alpha = rearrange(alpha, '1 ... -> ...')
+
+        with torch.no_grad():
+            alpha_residual_stats = alpha[..., self.num_input_views * self.num_fracs:]
+            alpha_residual_stats = alpha_residual_stats.clamp_min(1e-12)
+
+            entropy = -(alpha_residual_stats * alpha_residual_stats.log()).sum(dim = (-1, -2)).mean()
+
+            eye = torch.eye(
+                alpha_residual_stats.shape[-1],
+                device = alpha_residual_stats.device,
+                dtype = alpha_residual_stats.dtype,
+            )
+            identity_dist = (alpha_residual_stats - eye).abs().mean()
+
+            self.last_h_res_entropy = float(entropy)
+            self.last_h_res_identity_distance = float(identity_dist)
 
         alpha = rearrange(alpha, '... (s f) t -> ... s f t', s = streams) # (batch, seq, fracs1, streams, fracs2, input + residual streams)
 
