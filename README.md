@@ -129,6 +129,36 @@ python -m scripts.plot_mhc --mhc ./path/to/trained/model --ascii
 python -m scripts.compare_generation --mhc ./path/to/trained/model
 ```
 
+### Evaluate Perplexity And Sample Generations
+```bash
+# Perplexity only (custom dataset path and split)
+python -m scripts.eval_perplexity_and_generate \
+    --model-path output/qwen3_mhc_v2 \
+    --dataset-path data/sangraha_packed \
+    --split validation \
+    --batch-size 2 \
+    --max-eval-batches 100
+
+# Sample generations only (multiple prompts)
+python -m scripts.eval_perplexity_and_generate \
+    --model-path output/qwen3_mhc_v2 \
+    --prompt "Explain gradient checkpointing in simple terms." \
+    --prompt "Translate to Hindi: We learn every day." \
+    --max-new-tokens 80 \
+    --do-sample \
+    --temperature 0.8 \
+    --top-p 0.9
+
+# Combined mode + machine-readable outputs
+python -m scripts.eval_perplexity_and_generate \
+    --model-path output/qwen3_mhc_v2 \
+    --dataset-path data/sangraha_packed \
+    --split validation \
+    --prompts-file prompts.txt \
+    --output-json output/diagnostics/eval_summary.json \
+    --generations-jsonl output/diagnostics/generations.jsonl
+```
+
 **What to look for after training:**
 - **H_res identity distance > 0**: Streams are mixing!
 - **Alpha values changing from 0.01**: Dynamic coefficients matter

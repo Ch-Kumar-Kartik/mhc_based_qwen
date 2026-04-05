@@ -21,11 +21,22 @@ os.environ.setdefault("CUDA_DEVICE_MAX_CONNECTIONS", "1")
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, SequentialSampler
-from transformers import get_scheduler
+from transformers import AutoModelForCausalLM, get_scheduler
 from datasets import load_from_disk, concatenate_datasets
 from tqdm import tqdm
 
 from src.conversionV2 import load_mhc_model_v2, convert_qwen3_to_mhc_v2, count_parameters_v2
+
+
+HYPER_CONNECTION_TRAINABLE_LEAF_NAMES = {
+    "dynamic_alpha_fn",
+    "static_alpha",
+    "dynamic_beta_fn",
+    "static_beta",
+    "pre_branch_scale",
+    "residual_scale",
+    "h_post_scale",
+}
 
 
 def _has_triton() -> bool:
@@ -44,6 +55,31 @@ def _set_original_parameter_trainability(model, requires_grad: bool) -> bool:
     for param in base_model.get_original_parameters():
         param.requires_grad = requires_grad
     return True
+
+
+def _set_trainability_by_leaf_name(model, trainable_leaf_names: set[str]) -> dict:
+    """Freeze all parameters except those whose leaf name matches `trainable_leaf_names`."""
+    base_model = _get_underlying_model(model)
+    trainable_params = 0
+    frozen_params = 0
+    trainable_named_params = []
+
+    for name, param in base_model.named_parameters():
+        leaf_name = name.rsplit(".", 1)[-1]
+        should_train = leaf_name in trainable_leaf_names
+        param.requires_grad = should_train
+
+        if should_train:
+            trainable_params += param.numel()
+            trainable_named_params.append(name)
+        else:
+            frozen_params += param.numel()
+
+    return {
+        "trainable_params": trainable_params,
+        "frozen_params": frozen_params,
+        "trainable_named_params": trainable_named_params,
+    }
 
 
 def _get_monitoring_stats(model):
@@ -196,6 +232,52 @@ def compute_loss(outputs, batch):
     return F.cross_entropy(shift_logits, shift_labels, ignore_index=-100)
 
 
+def compute_distillation_loss(
+    student_logits: torch.Tensor,
+    teacher_logits: torch.Tensor,
+    attention_mask: Optional[torch.Tensor],
+    temperature: float,
+) -> torch.Tensor:
+    """Compute next-token KL distillation loss only."""
+    if temperature <= 0:
+        raise ValueError(f"distill temperature must be > 0, got {temperature}")
+
+    student_shift = student_logits[..., :-1, :].float()
+    teacher_shift = teacher_logits[..., :-1, :].float()
+
+    student_log_probs = F.log_softmax(student_shift / temperature, dim=-1)
+    teacher_probs = F.softmax(teacher_shift / temperature, dim=-1)
+
+    token_kl = F.kl_div(student_log_probs, teacher_probs, reduction="none").sum(dim=-1)
+
+    if attention_mask is not None:
+        token_mask = attention_mask[..., 1:].to(token_kl.dtype)
+    else:
+        token_mask = torch.ones_like(token_kl)
+
+    normalizer = token_mask.sum().clamp_min(1.0)
+    return (token_kl * token_mask).sum() / normalizer * (temperature * temperature)
+
+
+def compute_hc_aux_loss(model) -> torch.Tensor:
+    """Compute auxiliary HC loss from hyper-connection parameters only.
+
+    The auxiliary term is the mean squared magnitude of selected HC parameters.
+    """
+    base_model = _get_underlying_model(model)
+
+    hc_terms = []
+    for name, param in base_model.named_parameters():
+        leaf_name = name.rsplit(".", 1)[-1]
+        if leaf_name in HYPER_CONNECTION_TRAINABLE_LEAF_NAMES:
+            hc_terms.append(param.float().pow(2).mean())
+
+    if not hc_terms:
+        raise RuntimeError("No hyper-connection parameters found for auxiliary HC loss.")
+
+    return torch.stack(hc_terms).mean()
+
+
 # =========================
 # DATA LOADING
 # =========================
@@ -296,6 +378,20 @@ def main():
                         help="torch.compile mode.")
     parser.add_argument('--use-fused-adamw', action='store_true',
                         help="Use fused AdamW when supported by this PyTorch/CUDA build.")
+    parser.add_argument('--train-only-hyper-connection-params', action='store_true',
+                        help='Train only hyper-connection tensors: dynamic/static alpha-beta scales.')
+    parser.add_argument('--distillation-only', action='store_true',
+                        help='Use distillation KL loss only (no CE labels loss).')
+    parser.add_argument('--teacher-model', type=str, default=None,
+                        help='Teacher model path/name for distillation (defaults to --base-model).')
+    parser.add_argument('--distill-temperature', type=float, default=1.0,
+                        help='Temperature for KL distillation loss.')
+    parser.add_argument('--use-mixed-lm-hc-loss', action='store_true',
+                        help='Use weighted mixed objective: lm_loss_weight*LM + hc_loss_weight*HC.')
+    parser.add_argument('--lm-loss-weight', type=float, default=0.75,
+                        help='Weight for standard LM loss in mixed objective (recommended 0.7-0.8).')
+    parser.add_argument('--hc-loss-weight', type=float, default=0.25,
+                        help='Weight for HC auxiliary loss in mixed objective (recommended 0.2-0.3).')
     parser.add_argument('--no-gradient-checkpointing', action='store_true',
                         help="Disable gradient checkpointing (faster, but higher VRAM use).")
     parser.add_argument('--log-interval', type=int, default=100,
@@ -344,8 +440,31 @@ def main():
         f"batch_size={args.batch_size}, grad_accum={args.gradient_accumulation_steps}, "
         f"total_steps={args.total_steps}, lr={args.learning_rate:.2e}, warmup={args.warmup_steps}, "
         f"save_steps={args.save_steps}, workers={args.num_workers}, compile={args.use_compile}, "
-        f"dtype={args.dtype}, scaler_enabled={use_grad_scaler}, freeze_original_steps={args.freeze_original_steps}"
+        f"dtype={args.dtype}, scaler_enabled={use_grad_scaler}, freeze_original_steps={args.freeze_original_steps}, "
+        f"hc_only={args.train_only_hyper_connection_params}, distill_only={args.distillation_only}, "
+        f"distill_temp={args.distill_temperature}, mixed_lm_hc={args.use_mixed_lm_hc_loss}, "
+        f"lm_w={args.lm_loss_weight}, hc_w={args.hc_loss_weight}"
     )
+
+    if args.use_mixed_lm_hc_loss and args.distillation_only:
+        raise ValueError("--use-mixed-lm-hc-loss cannot be combined with --distillation-only")
+
+    if args.use_mixed_lm_hc_loss:
+        if args.lm_loss_weight <= 0 or args.hc_loss_weight <= 0:
+            raise ValueError("In mixed mode, both --lm-loss-weight and --hc-loss-weight must be > 0")
+
+        total_mixed_weight = args.lm_loss_weight + args.hc_loss_weight
+        if not math.isclose(total_mixed_weight, 1.0, rel_tol=0.0, abs_tol=1e-6):
+            logger.warning(
+                "Mixed weights do not sum to 1.0; normalizing automatically: "
+                f"lm={args.lm_loss_weight:.4f}, hc={args.hc_loss_weight:.4f}"
+            )
+            args.lm_loss_weight = args.lm_loss_weight / total_mixed_weight
+            args.hc_loss_weight = args.hc_loss_weight / total_mixed_weight
+        logger.info(
+            f"Mixed LM+HC objective enabled with lm_loss_weight={args.lm_loss_weight:.3f}, "
+            f"hc_loss_weight={args.hc_loss_weight:.3f}"
+        )
 
     train_ds, val_ds = load_data(args.tokenized_dir, logger=logger)
     train_ds.set_format(type='torch')
@@ -423,7 +542,25 @@ def main():
         model.config.use_cache = False
 
     original_parameters_frozen = False
-    if args.freeze_original_steps > 0:
+    if args.train_only_hyper_connection_params:
+        trainability_stats = _set_trainability_by_leaf_name(
+            model,
+            HYPER_CONNECTION_TRAINABLE_LEAF_NAMES,
+        )
+        if trainability_stats["trainable_params"] == 0:
+            raise RuntimeError(
+                "No trainable hyper-connection parameters matched requested leaf names."
+            )
+        logger.info(
+            "Hyper-connection-only mode active: "
+            f"trainable={trainability_stats['trainable_params']:,}, "
+            f"frozen={trainability_stats['frozen_params']:,}"
+        )
+        logger.info(
+            "Trainable parameter name samples: "
+            + ", ".join(trainability_stats["trainable_named_params"][:10])
+        )
+    elif args.freeze_original_steps > 0:
         if _set_original_parameter_trainability(model, False):
             original_parameters_frozen = True
             logger.info(
@@ -431,6 +568,25 @@ def main():
             )
 
     model.to(device)
+
+    teacher_model = None
+    if args.distillation_only:
+        teacher_name_or_path = args.teacher_model or args.base_model
+        logger.info(f"Loading teacher model for distillation: {teacher_name_or_path}")
+        teacher_model = AutoModelForCausalLM.from_pretrained(
+            teacher_name_or_path,
+            torch_dtype=model_dtype,
+            trust_remote_code=False,
+            local_files_only=args.local_files_only,
+            attn_implementation="eager",
+        )
+        teacher_model.to(device)
+        teacher_model.eval()
+        for p in teacher_model.parameters():
+            p.requires_grad = False
+
+        if hasattr(teacher_model, "gradient_checkpointing_disable"):
+            teacher_model.gradient_checkpointing_disable()
 
     try:
         param_counts = count_parameters_v2(model)
@@ -458,15 +614,19 @@ def main():
         except Exception as e:
             logger.warning(f"torch.compile failed, continuing without compile: {e}")
 
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    if not trainable_params:
+        raise RuntimeError("No trainable parameters found after applying trainability settings.")
+
     if args.use_fused_adamw:
         try:
-            optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, fused=True)
+            optimizer = torch.optim.AdamW(trainable_params, lr=args.learning_rate, fused=True)
             logger.info("Using fused AdamW")
         except TypeError:
-            optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate)
+            optimizer = torch.optim.AdamW(trainable_params, lr=args.learning_rate)
             logger.warning("Fused AdamW unsupported in this build; using standard AdamW")
     else:
-        optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate)
+        optimizer = torch.optim.AdamW(trainable_params, lr=args.learning_rate)
     scheduler = get_scheduler(
         "linear",
         optimizer,
@@ -500,9 +660,13 @@ def main():
 
     pbar = tqdm(total=args.total_steps, initial=global_step)
     recent_losses = deque(maxlen=50)
+    recent_lm_losses = deque(maxlen=50)
+    recent_hc_losses = deque(maxlen=50)
     recent_step_times = deque(maxlen=50)
     train_start_time = time.perf_counter()
     accumulated_micro_loss = 0.0
+    accumulated_micro_lm_loss = 0.0
+    accumulated_micro_hc_loss = 0.0
     micro_batch_count = 0
 
     logger.info("Entering training loop")
@@ -527,10 +691,40 @@ def main():
                         outputs = model(**batch)
                     else:
                         raise
-                raw_loss = compute_loss(outputs, batch)
+                if args.distillation_only:
+                    with torch.no_grad():
+                        teacher_outputs = teacher_model(
+                            input_ids=batch["input_ids"],
+                            attention_mask=batch.get("attention_mask"),
+                            use_cache=False,
+                            return_dict=True,
+                        )
+                    raw_loss = compute_distillation_loss(
+                        student_logits=outputs.logits,
+                        teacher_logits=teacher_outputs.logits,
+                        attention_mask=batch.get("attention_mask"),
+                        temperature=args.distill_temperature,
+                    )
+                    lm_component_loss = raw_loss
+                    hc_component_loss = None
+                else:
+                    lm_component_loss = compute_loss(outputs, batch)
+                    if args.use_mixed_lm_hc_loss:
+                        hc_component_loss = compute_hc_aux_loss(model)
+                        raw_loss = (
+                            args.lm_loss_weight * lm_component_loss
+                            + args.hc_loss_weight * hc_component_loss
+                        )
+                    else:
+                        hc_component_loss = None
+                        raw_loss = lm_component_loss
                 loss = raw_loss / args.gradient_accumulation_steps
 
             accumulated_micro_loss += float(raw_loss.item())
+            if lm_component_loss is not None:
+                accumulated_micro_lm_loss += float(lm_component_loss.item())
+            if hc_component_loss is not None:
+                accumulated_micro_hc_loss += float(hc_component_loss.item())
             micro_batch_count += 1
 
             if torch.isnan(loss):
@@ -564,14 +758,25 @@ def main():
                 recent_step_times.append(optimizer_step_time)
 
                 mean_loss = accumulated_micro_loss / max(1, micro_batch_count)
+                mean_lm_loss = accumulated_micro_lm_loss / max(1, micro_batch_count)
+                mean_hc_loss = accumulated_micro_hc_loss / max(1, micro_batch_count)
                 recent_losses.append(mean_loss)
+                recent_lm_losses.append(mean_lm_loss)
+                if args.use_mixed_lm_hc_loss:
+                    recent_hc_losses.append(mean_hc_loss)
                 accumulated_micro_loss = 0.0
+                accumulated_micro_lm_loss = 0.0
+                accumulated_micro_hc_loss = 0.0
                 micro_batch_count = 0
 
                 global_step += 1
                 pbar.update(1)
 
-                if original_parameters_frozen and global_step >= args.freeze_original_steps:
+                if (
+                    (not args.train_only_hyper_connection_params)
+                    and original_parameters_frozen
+                    and global_step >= args.freeze_original_steps
+                ):
                     if _set_original_parameter_trainability(model, True):
                         original_parameters_frozen = False
                         logger.info(f"Stage 2 active: unfroze original parameters at step {global_step}")
@@ -579,6 +784,8 @@ def main():
                 if global_step % args.log_interval == 0:
                     lr = optimizer.param_groups[0]["lr"]
                     avg_loss = sum(recent_losses) / len(recent_losses) if recent_losses else mean_loss
+                    avg_lm_loss = sum(recent_lm_losses) / len(recent_lm_losses) if recent_lm_losses else mean_lm_loss
+                    avg_hc_loss = sum(recent_hc_losses) / len(recent_hc_losses) if recent_hc_losses else mean_hc_loss
                     avg_step_time = sum(recent_step_times) / len(recent_step_times) if recent_step_times else optimizer_step_time
                     grad_norm_value = float(grad_norm.item()) if torch.is_tensor(grad_norm) else float(grad_norm)
 
@@ -597,14 +804,27 @@ def main():
                     entropy = monitoring_stats.get("h_res_entropy_mean")
                     identity_dist = monitoring_stats.get("h_res_identity_distance_mean")
 
+                    phase = (
+                        "hc-only"
+                        if args.train_only_hyper_connection_params
+                        else ("frozen" if original_parameters_frozen else "unfrozen")
+                    )
+
                     log_msg = (
                         f"step={global_step}/{args.total_steps} "
                         f"loss={mean_loss:.4f} avg_loss={avg_loss:.4f} lr={lr:.3e} grad_norm={grad_norm_value:.3f} "
+                        f"lm_loss={mean_lm_loss:.4f} avg_lm_loss={avg_lm_loss:.4f} "
                         f"step_time={optimizer_step_time:.3f}s avg_step_time={avg_step_time:.3f}s "
                         f"tokens/s={tokens_per_sec:.1f} samples/s={samples_per_sec:.2f} "
                         f"elapsed={elapsed/60.0:.1f}m eta={eta_seconds/60.0:.1f}m "
-                        f"phase={'frozen' if original_parameters_frozen else 'unfrozen'}"
+                        f"phase={phase}"
                     )
+
+                    if args.use_mixed_lm_hc_loss:
+                        log_msg += (
+                            f" hc_loss={mean_hc_loss:.6f} avg_hc_loss={avg_hc_loss:.6f}"
+                            f" lm_w={args.lm_loss_weight:.2f} hc_w={args.hc_loss_weight:.2f}"
+                        )
 
                     if mem_stats:
                         log_msg += (
