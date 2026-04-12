@@ -14,11 +14,48 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import argparse
+import json
 import torch
-from transformers import AutoTokenizer
 
 from src.conversion import load_mhc_model
+from src.conversionV2 import load_mhc_model_v2
 from src.sinkhorn import sinkhorn_knopp
+
+
+def _load_mhc_model_auto(model_path: str):
+    """Load either V1 or V2 mHC checkpoint based on config.json model_type."""
+    config_path = Path(model_path) / "config.json"
+    model_type = ""
+    if config_path.exists():
+        with open(config_path, "r", encoding="utf-8") as f:
+            config = json.load(f)
+        model_type = str(config.get("model_type", ""))
+
+    if model_type == "qwen3_mhc_v2":
+        return load_mhc_model_v2(model_path, device="cpu", torch_dtype=torch.float32)
+
+    return load_mhc_model(model_path, device="cpu", torch_dtype=torch.float32)
+
+
+def _get_h_res_matrix(mhc) -> torch.Tensor:
+    """Get residual mixing matrix for either V1 (`b_res`) or V2 (`static_alpha`)."""
+    if hasattr(mhc, "b_res"):
+        return sinkhorn_knopp(mhc.b_res).squeeze()
+
+    if hasattr(mhc, "static_alpha"):
+        num_input = mhc.num_input_views * mhc.num_fracs
+        num_residual = mhc.num_residual_streams * mhc.num_fracs
+
+        alpha_residual = mhc.static_alpha.float()[..., num_input : num_input + num_residual]
+        alpha_residual = alpha_residual / float(getattr(mhc, "residual_mix_temperature", 1.0))
+        alpha_residual = torch.clamp(alpha_residual, -5.0, 5.0)
+        return mhc.residual_mix_constraint_fn(alpha_residual).squeeze()
+
+    raise AttributeError("Unsupported mHC module type: cannot extract residual mixing matrix")
+
+
+def _is_v1_style_module(mhc) -> bool:
+    return hasattr(mhc, "alpha_pre") and hasattr(mhc, "b_pre") and hasattr(mhc, "b_res")
 
 
 def summarize_all_layers(mhc_model):
@@ -36,16 +73,20 @@ def summarize_all_layers(mhc_model):
     
     for i, layer in enumerate(mhc_model.model.layers):
         mhc = layer.mhc_attn
-        
-        alpha_pre = mhc.alpha_pre.item()
-        alpha_post = mhc.alpha_post.item()
-        alpha_res = mhc.alpha_res.item()
-        
-        # b_post drift from 0
-        b_post_drift = mhc.b_post.abs().mean().item()
-        
+
+        if _is_v1_style_module(mhc):
+            alpha_pre = mhc.alpha_pre.item()
+            alpha_post = mhc.alpha_post.item()
+            alpha_res = mhc.alpha_res.item()
+            b_post_drift = mhc.b_post.abs().mean().item()
+        else:
+            alpha_pre = mhc.pre_branch_scale.item() if hasattr(mhc, "pre_branch_scale") else float("nan")
+            alpha_post = mhc.h_post_scale.item() if hasattr(mhc, "h_post_scale") else float("nan")
+            alpha_res = mhc.residual_scale.item() if hasattr(mhc, "residual_scale") else float("nan")
+            b_post_drift = mhc.static_beta.abs().mean().item() if hasattr(mhc, "static_beta") else float("nan")
+
         # H_res distance from identity
-        h_res = sinkhorn_knopp(mhc.b_res).squeeze()
+        h_res = _get_h_res_matrix(mhc)
         identity = torch.eye(4)
         h_res_dist = (h_res - identity).abs().mean().item()
         
@@ -87,6 +128,26 @@ def visualize_layer_static(mhc_model, layer_idx: int):
         print(f"\n{'─'*70}")
         print(f"{name}")
         print(f"{'─'*70}")
+
+        if not _is_v1_style_module(mhc):
+            print("\n  V2 module detected (hyper/frac-connections parameterization).")
+            print("  Scalar gates:")
+            print(f"    pre_branch_scale: {mhc.pre_branch_scale.item():.6f}")
+            print(f"    residual_scale:   {mhc.residual_scale.item():.6f}")
+            if hasattr(mhc, "h_post_scale"):
+                print(f"    h_post_scale:     {mhc.h_post_scale.item():.6f}")
+
+            h_res = _get_h_res_matrix(mhc)
+            print("\n  Residual mixing matrix (effective H_res from static_alpha residual block):")
+            for i in range(4):
+                row = h_res[i].tolist()
+                row_str = " ".join(f"{v:6.4f}" for v in row)
+                print(f"    [{row_str}]  <- from stream {i}")
+
+            identity = torch.eye(4)
+            dist = (h_res - identity).abs().mean().item()
+            print(f"\n  Identity distance: {dist:.4f} (0=no mixing, higher=more mixing)")
+            continue
         
         # Alpha values
         print(f"\n  Alpha gating (init=0.01):")
@@ -154,6 +215,26 @@ def compare_init_vs_trained(mhc_model, layer_idx: int = 0):
     
     layer = mhc_model.model.layers[layer_idx]
     mhc = layer.mhc_attn
+
+    if not _is_v1_style_module(mhc):
+        print("\nV2 module detected. Showing V2-focused drift summary.")
+        print(f"\n{'Parameter':<24} {'Expected Init':<20} {'Actual':<20} {'Drift':<10}")
+        print("─"*78)
+
+        pre_branch_scale = mhc.pre_branch_scale.item()
+        residual_scale = mhc.residual_scale.item()
+        print(f"{'pre_branch_scale':<24} {'0.0000':<20} {pre_branch_scale:<20.4f} {abs(pre_branch_scale):<10.4f}")
+        print(f"{'residual_scale':<24} {'0.0000':<20} {residual_scale:<20.4f} {abs(residual_scale):<10.4f}")
+
+        if hasattr(mhc, "h_post_scale"):
+            h_post_scale = mhc.h_post_scale.item()
+            print(f"{'h_post_scale':<24} {'0.0000':<20} {h_post_scale:<20.4f} {abs(h_post_scale):<10.4f}")
+
+        h_res = _get_h_res_matrix(mhc)
+        identity = torch.eye(4)
+        h_res_dist = (h_res - identity).abs().mean().item()
+        print(f"{'H_res identity dist':<24} {'0.0000':<20} {h_res_dist:<20.4f} {h_res_dist:<10.4f}")
+        return
     
     print(f"\n{'Parameter':<20} {'Expected Init':<20} {'Actual':<20} {'Drift':<10}")
     print("─"*70)
@@ -180,7 +261,7 @@ def compare_init_vs_trained(mhc_model, layer_idx: int = 0):
     print(f"{'b_res off-diag':<20} {'0.0000':<20} {off_diag_mean:<20.4f} {abs(off_diag_mean):<10.4f}")
     
     # H_res identity distance
-    h_res = sinkhorn_knopp(mhc.b_res).squeeze()
+    h_res = _get_h_res_matrix(mhc)
     identity = torch.eye(4)
     h_res_dist = (h_res - identity).abs().mean().item()
     print(f"{'H_res identity dist':<20} {'0.0000':<20} {h_res_dist:<20.4f} {h_res_dist:<10.4f}")
@@ -194,7 +275,7 @@ def main():
     args = parser.parse_args()
     
     print("Loading mHC model...")
-    mhc_model, tokenizer = load_mhc_model(args.mhc, device="cpu", torch_dtype=torch.float32)
+    mhc_model, tokenizer = _load_mhc_model_auto(args.mhc)
     mhc_model.eval()
     
     # Quick summary first - also returns layer with most drift
