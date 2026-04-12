@@ -45,9 +45,14 @@ if TYPE_CHECKING:
 
 
 _STEP_RE = re.compile(
-    r"Step\s+(?P<step>\d+):\s+loss=(?P<loss>[0-9]*\.?[0-9]+)"  # loss
+    r"Step\s+(?P<step>\d+):\s+loss=(?P<loss>[0-9eE+\-\.]+)"  # legacy loss
     r"(?:,\s+lr=(?P<lr>[0-9eE+\-\.]+))?"  # optional lr
     r"(?:,\s+grad_norm=(?P<grad_norm>[0-9eE+\-\.]+))?"  # optional grad_norm
+)
+
+_STEP_PIPE_RE = re.compile(
+    r"step=(?P<step>\d+)/\d+.*?loss=(?P<loss>[0-9eE+\-\.]+)"  # current train.py format
+    r"(?:.*?grad_norm=(?P<grad_norm>[0-9eE+\-\.]+))?"
 )
 
 
@@ -67,6 +72,8 @@ def _load_step_series_from_log(path: str) -> Series:
     with open(path, "r", encoding="utf-8", errors="ignore") as f:
         for line in f:
             m = _STEP_RE.search(line)
+            if not m:
+                m = _STEP_PIPE_RE.search(line)
             if not m:
                 continue
             steps.append(int(m.group("step")))

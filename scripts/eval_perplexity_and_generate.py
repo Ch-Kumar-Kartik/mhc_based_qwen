@@ -266,12 +266,41 @@ def _read_prompts(inline_prompts: List[str], prompts_file: Optional[str]) -> Lis
     return deduped
 
 
+def _build_generation_inputs(tokenizer, prompt: str, system_prompt: str) -> Dict[str, torch.Tensor]:
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": prompt},
+    ]
+
+    if hasattr(tokenizer, "apply_chat_template"):
+        try:
+            encoded = tokenizer.apply_chat_template(
+                messages,
+                add_generation_prompt=True,
+                return_tensors="pt",
+            )
+            if torch.is_tensor(encoded):
+                return {"input_ids": encoded}
+        except Exception:
+            pass
+
+    chat_prompt = (
+        "<|im_start|>system\n"
+        f"{system_prompt}<|im_end|>\n"
+        "<|im_start|>user\n"
+        f"{prompt}<|im_end|>\n"
+        "<|im_start|>assistant\n"
+    )
+    return tokenizer(chat_prompt, return_tensors="pt")
+
+
 @torch.inference_mode()
 def _generate_samples(
     model,
     tokenizer,
     prompts: List[str],
     device: str,
+    system_prompt: str,
     max_new_tokens: int,
     do_sample: bool,
     temperature: float,
@@ -283,18 +312,17 @@ def _generate_samples(
     generations: List[Dict[str, Any]] = []
 
     for idx, prompt in enumerate(prompts, start=1):
-        enc = tokenizer(prompt, return_tensors="pt")
+        enc = _build_generation_inputs(tokenizer, prompt, system_prompt)
         enc = {k: v.to(device) for k, v in enc.items()}
 
+        # Keep generation deterministic for CPU/GPU parity debugging.
         gen_kwargs = dict(
             max_new_tokens=max_new_tokens,
-            do_sample=do_sample,
-            temperature=temperature,
-            top_p=top_p,
-            top_k=top_k,
-            num_beams=num_beams,
+            do_sample=False,
+            num_beams=1,
             repetition_penalty=repetition_penalty,
             pad_token_id=tokenizer.pad_token_id,
+            use_cache=False,
         )
 
         started = time.perf_counter()
@@ -375,6 +403,11 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--prompt", action="append", default=[], help="Inline prompt (repeatable)")
     parser.add_argument("--prompts-file", default=None, help="Text file with one prompt per line")
+    parser.add_argument(
+        "--system-prompt",
+        default="You are a helpful assistant. Answer in the same language as the user.",
+        help="System prompt used when formatting chat-style generations",
+    )
 
     parser.add_argument("--max-new-tokens", type=int, default=64)
     parser.add_argument("--do-sample", action="store_true")
@@ -405,6 +438,10 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+
+    torch.manual_seed(42)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(42)
 
     device = _resolve_device(args.device)
     torch_dtype = _parse_dtype(args.dtype)
@@ -507,6 +544,7 @@ def main() -> None:
             tokenizer=tokenizer,
             prompts=prompts,
             device=device,
+            system_prompt=args.system_prompt,
             max_new_tokens=args.max_new_tokens,
             do_sample=args.do_sample,
             temperature=args.temperature,
