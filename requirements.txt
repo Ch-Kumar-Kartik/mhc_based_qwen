@@ -17,6 +17,7 @@ tensorboard>=2.15.0
 
 # Utilities
 einops>=0.6.0
+plotly>=6.7.0
 
 # Optional: Croissant metadata loading (HF datasets alternative)
 requests>=2.31.0
