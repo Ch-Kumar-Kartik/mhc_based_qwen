@@ -1,0 +1,140 @@
+Detected accelerate version: 1.12.0
+Detected datasets version: 4.5.0
+Detected jinja2 version: 3.1.6
+Detected nltk version: 3.9.4
+Detected pandas version: 3.0.0
+Detected peft version: 0.19.0
+Detected psutil version: 7.2.2
+Detected pygments version: 2.19.2
+Detected pytest version: 9.0.2
+Detected safetensors version: 0.7.0
+Detected scipy version: 1.17.0
+Detected tokenizers version: 0.22.2
+Detected torchaudio version: 2.5.1+cu121
+Detected torchvision version: 0.20.1+cu121
+Detected matplotlib version: 3.10.8
+Detected torch version: 2.5.1+cu121
+Successfully imported pydantic version 2.12.5
+Detected PIL version 12.1.0
+E:\mhc_based_qwen-2\qwvenv2\Lib\site-packages\transformers\utils\hub.py:110: FutureWarning: Using `TRANSFORMERS_CACHE` is deprecated and will be removed in v5 of Transformers. Use `HF_HOME` instead.
+  warnings.warn(
+Detected torch version: 2.5.1+cu121
+Detected torch version: 2.5.1+cu121
+Detected torch version: 2.5.1+cu121
+Detected torch version: 2.5.1+cu121
+Detected torch version: 2.5.1+cu121
+Detected torch version: 2.5.1+cu121
+Detected torch version: 2.5.1+cu121
+Detected torch version: 2.5.1+cu121
+Detected torch version: 2.5.1+cu121
+Detected torch version: 2.5.1+cu121
+Detected torch version: 2.5.1+cu121
+Detected torch version: 2.5.1+cu121
+Detected torch version: 2.5.1+cu121
+loading file vocab.json from cache at E:\mhc_based_qwen-2\hf_cache\models--Qwen--Qwen3-0.6B\snapshots\c1899de289a04d12100db370d81485cdf75e47ca\vocab.json
+loading file merges.txt from cache at E:\mhc_based_qwen-2\hf_cache\models--Qwen--Qwen3-0.6B\snapshots\c1899de289a04d12100db370d81485cdf75e47ca\merges.txt
+loading file tokenizer.json from cache at E:\mhc_based_qwen-2\hf_cache\models--Qwen--Qwen3-0.6B\snapshots\c1899de289a04d12100db370d81485cdf75e47ca\tokenizer.json
+loading file added_tokens.json from cache at None
+loading file special_tokens_map.json from cache at None
+loading file tokenizer_config.json from cache at E:\mhc_based_qwen-2\hf_cache\models--Qwen--Qwen3-0.6B\snapshots\c1899de289a04d12100db370d81485cdf75e47ca\tokenizer_config.json
+loading file chat_template.jinja from cache at None
+Special tokens have been added in the vocabulary, make sure the associated word embeddings are fine-tuned or trained.
+Detected torch version: 2.5.1+cu121
+`torch_dtype` is deprecated! Use `dtype` instead!
+loading configuration file E:\mhc_based_qwen-2\output\qwen3_mhc_v2_parity_mixed_30k_1_latest\checkpoint-30000\config.json
+Model config Qwen3MHCConfigV2 {
+  "add_attn_pool_reduce_stream": false,
+  "add_stream_embed": true,
+  "architectures": [
+    "Qwen3MHCForCausalLMV2"
+  ],
+  "attention_bias": false,
+  "attention_dropout": 0.0,
+  "dtype": "bfloat16",
+  "head_dim": 128,
+  "hidden_act": "silu",
+  "hidden_size": 1024,
+  "initializer_range": 0.02,
+  "intermediate_size": 3072,
+  "layer_types": [
+    "full_attention",
+    "full_attention",
+    "full_attention",
+    "full_attention",
+    "full_attention",
+    "full_attention",
+    "full_attention",
+    "full_attention",
+    "full_attention",
+    "full_attention",
+    "full_attention",
+    "full_attention",
+    "full_attention",
+    "full_attention",
+    "full_attention",
+    "full_attention",
+    "full_attention",
+    "full_attention",
+    "full_attention",
+    "full_attention",
+    "full_attention",
+    "full_attention",
+    "full_attention",
+    "full_attention",
+    "full_attention",
+    "full_attention",
+    "full_attention",
+    "full_attention"
+  ],
+  "log_domain_sinkhorn": false,
+  "max_position_embeddings": 40960,
+  "max_window_layers": 28,
+  "mhc_dropout": 0.0,
+  "mlp_bias": false,
+  "model_type": "qwen3_mhc_v2",
+  "n_streams": 4,
+  "num_attention_heads": 16,
+  "num_dynamic_alpha_proposals": 1,
+  "num_fracs": 1,
+  "num_hidden_layers": 28,
+  "num_input_views": 1,
+  "num_key_value_heads": 8,
+  "residual_mix_temperature": 1.0,
+  "rms_norm_eps": 1e-06,
+  "rope_parameters": {
+    "rope_theta": 1000000,
+    "rope_type": "default"
+  },
+  "rope_scaling": null,
+  "rope_theta": 1000000.0,
+  "sinkhorn_iters": 20,
+  "sliding_window": 4096,
+  "transformers_version": "4.57.6",
+  "use_cache": false,
+  "use_sliding_window": false,
+  "use_triton_sinkhorn": false,
+  "vocab_size": 151936
+}
+
+loading weights file E:\mhc_based_qwen-2\output\qwen3_mhc_v2_parity_mixed_30k_1_latest\checkpoint-30000\model.safetensors
+Instantiating Qwen3MHCForCausalLMV2 model under default dtype torch.bfloat16.
+Generate config GenerationConfig {
+  "use_cache": false
+}
+
+loading configuration file E:\mhc_based_qwen-2\output\qwen3_mhc_v2_parity_mixed_30k_1_latest\checkpoint-30000\generation_config.json
+Generate config GenerationConfig {}
+
+Could not locate the custom_generate/generate.py inside E:\mhc_based_qwen-2\output\qwen3_mhc_v2_parity_mixed_30k_1_latest\checkpoint-30000.
+loading file vocab.json from cache at E:\mhc_based_qwen-2\hf_cache\models--Qwen--Qwen3-0.6B\snapshots\c1899de289a04d12100db370d81485cdf75e47ca\vocab.json
+loading file merges.txt from cache at E:\mhc_based_qwen-2\hf_cache\models--Qwen--Qwen3-0.6B\snapshots\c1899de289a04d12100db370d81485cdf75e47ca\merges.txt
+loading file tokenizer.json from cache at E:\mhc_based_qwen-2\hf_cache\models--Qwen--Qwen3-0.6B\snapshots\c1899de289a04d12100db370d81485cdf75e47ca\tokenizer.json
+loading file added_tokens.json from cache at None
+loading file special_tokens_map.json from cache at None
+loading file tokenizer_config.json from cache at E:\mhc_based_qwen-2\hf_cache\models--Qwen--Qwen3-0.6B\snapshots\c1899de289a04d12100db370d81485cdf75e47ca\tokenizer_config.json
+loading file chat_template.jinja from cache at None
+Special tokens have been added in the vocabulary, make sure the associated word embeddings are fine-tuned or trained.
+Generating test split: 0 examples [00:00, ? examples/s]Generating test split: 4420 examples [00:00, 32579.64 examples/s]Generating test split: 4420 examples [00:00, 32308.30 examples/s]
+E:\mhc_based_qwen-2\qwvenv2\Lib\site-packages\torch\nn\modules\module.py:1747: FutureWarning: `past_key_value` is deprecated and will be removed in version 4.58 for `Qwen3Attention.forward`. Use `past_key_values` instead.
+  return forward_call(*args, **kwargs)
+Generating test split: 0 examples [00:00, ? examples/s]Generating test split: 10000 examples [00:02, 4516.49 examples/s]Generating test split: 10000 examples [00:02, 4436.35 examples/s]
