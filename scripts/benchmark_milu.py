@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sys
 import random
 import re
 import time
@@ -22,6 +23,12 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 import torch
 from datasets import load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
+
+# Ensure repository root is on sys.path so local packages (src) are importable
+# when executing this script directly (python scripts/benchmark_milu.py).
+_repo_root = Path(__file__).resolve().parent.parent
+if str(_repo_root) not in sys.path:
+    sys.path.insert(0, str(_repo_root))
 
 
 LANGUAGES = [
@@ -291,43 +298,7 @@ def _extract_answer_letter(text: str) -> str:
     return ""
 
 
-def _option_logprob(
-    model,
-    tokenizer,
-    formatted_prompt: str,
-    option_text: str,
-    device: str,
-    max_input_tokens: int,
-) -> float:
-    option_suffix = " " + option_text
-    full_text = formatted_prompt + option_suffix
-
-    full_ids = tokenizer(
-        full_text,
-        add_special_tokens=True,
-        truncation=True,
-        max_length=max_input_tokens,
-    )["input_ids"]
-    option_ids = tokenizer(option_suffix, add_special_tokens=False)["input_ids"]
-
-    if not option_ids or len(full_ids) <= len(option_ids):
-        return float("-inf")
-
-    start = len(full_ids) - len(option_ids)
-    if start <= 0:
-        return float("-inf")
-
-    input_ids = torch.tensor([full_ids], device=device)
-    outputs = model(input_ids=input_ids, use_cache=False)
-    logits = outputs.logits[0]
-
-    total_logprob = 0.0
-    for pos in range(start, len(full_ids)):
-        tok_id = full_ids[pos]
-        token_logprob = torch.log_softmax(logits[pos - 1], dim=-1)[tok_id].item()
-        total_logprob += token_logprob
-
-    return total_logprob
+from milu_hf import option_logprob as _option_logprob
 
 
 @torch.inference_mode()
