@@ -1,5 +1,14 @@
 # mHC: Manifold-Constrained Hyper-Connections for Qwen3-0.6B
 
+## What's New (2026-05-29)
+
+- **V2 is the recommended default**: The V2 implementation and conversion path are now the primary workflow for training and conversion.
+- **Conversion & validation CLIs**: Use `scripts/convert_to_mhc_v2.py` and `scripts/validate_equivalence.py` for warm-start conversion and equivalence checks.
+- **Config-driven training**: `scripts/train_v2.py` and the YAML configs in `configs/` are the preferred entrypoints for reproducible runs.
+- **Streaming dataset prep**: See `STREAMING_PREPARE.md` and the `prepare_dataset_*` scripts for streaming-friendly packing and verified shards.
+- **Windows/offline notes**: Added platform guidance for Windows HDD I/O and offline model loading (see Platform-Specific Notes).
+- **Outputs & diagnostics**: Notable output folders (e.g. `output/qwen3_mhc_v2_converted`, `output/diagnostics/`) are used for converted checkpoints and evaluation artifacts.
+
 ## Project Overview
 
 This project implements **Manifold-Constrained Hyper-Connections (mHC)** to expand the Qwen3-0.6B model architecture. mHC is a technique developed by DeepSeek-AI that extends the standard residual connection paradigm by:
