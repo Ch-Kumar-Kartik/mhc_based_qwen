@@ -145,21 +145,63 @@ def _collect_h_res_per_sublayer(
     collected: List[torch.Tensor] = []
     hooks = []
 
-    def _make_pre_hook(layer_name: str):
-        def _pre_hook(module, args, kwargs):
-            # args[0] is x: (B, S, n, C)
-            x = args[0]
-            B, S, n, C = x.shape
-            x_flat = x.view(B, S, n * C)
-            with torch.no_grad():
-                _, _, h_res = module.compute_coefficients(x_flat)
-            collected.append(h_res.detach().to("cpu"))
-        return _pre_hook
+    # Check if this is a V2 model by looking at the model class
+    is_v2 = hasattr(mhc_model.model.layers[0].mhc_attn, 'width_connection')
 
-    # Register hooks
-    for layer in mhc_model.model.layers:
-        hooks.append(layer.mhc_attn.register_forward_pre_hook(_make_pre_hook("attn"), with_kwargs=True))
-        hooks.append(layer.mhc_mlp.register_forward_pre_hook(_make_pre_hook("mlp"), with_kwargs=True))
+    if is_v2:
+        # V2 hook: collect alpha_residual from width_connection
+        def _make_v2_hook(layer_name: str):
+            def _hook(module, input, output):
+                # output is (branch_input, residuals, dict_with_beta)
+                # We need to extract the alpha_residual from the module's last computation
+                # Since V2 doesn't expose it directly, we'll use the static analysis approach
+                pass
+            return _hook
+        
+        # For V2, use static analysis instead of hooks
+        # Extract alpha_residual from model parameters
+        for layer in mhc_model.model.layers:
+            for mhc_module in [layer.mhc_attn, layer.mhc_mlp]:
+                # Get alpha_residual from static parameters
+                s = mhc_module.num_residual_streams
+                f = mhc_module.num_fracs
+                v = mhc_module.num_input_views
+
+                static_alpha = mhc_module.static_alpha.detach().float()
+                sf = s * f
+                vf = v * f
+
+                alpha_residual = mhc_module.residual_mix_constraint_fn(static_alpha[:, vf:])
+                
+                # Reshape to (B, S, n, n) - but we only have static params
+                # Expand to match batch and sequence dims from input
+                B = input_ids.shape[0]
+                S = input_ids.shape[1]
+                n = s
+                
+                # Reshape alpha_residual from (sf, sf) to (s, f, s, f) then to (s, s)
+                alpha_residual_collapsed = alpha_residual.reshape(s, f, s, f).mean(dim=(1, 3))
+                
+                # Expand to (B, S, s, s)
+                h_res_expanded = alpha_residual_collapsed.unsqueeze(0).unsqueeze(0).expand(B, S, -1, -1)
+                collected.append(h_res_expanded.to("cpu"))
+    else:
+        # V1 hook: collect from compute_coefficients
+        def _make_pre_hook(layer_name: str):
+            def _pre_hook(module, args, kwargs):
+                # args[0] is x: (B, S, n, C)
+                x = args[0]
+                B, S, n, C = x.shape
+                x_flat = x.view(B, S, n * C)
+                with torch.no_grad():
+                    _, _, h_res = module.compute_coefficients(x_flat)
+                collected.append(h_res.detach().to("cpu"))
+            return _pre_hook
+
+        # Register hooks
+        for layer in mhc_model.model.layers:
+            hooks.append(layer.mhc_attn.register_forward_pre_hook(_make_pre_hook("attn"), with_kwargs=True))
+            hooks.append(layer.mhc_mlp.register_forward_pre_hook(_make_pre_hook("mlp"), with_kwargs=True))
 
     try:
         with torch.no_grad():
@@ -187,15 +229,34 @@ def _compute_mhc_mappings(
     max_length: int,
 ) -> Dict[str, np.ndarray]:
     import torch
+    import json
+    import os
 
-    from src.conversion import load_mhc_model
+    config_path = os.path.join(mhc_model_path, "config.json")
+    is_v2 = False
+    if os.path.exists(config_path):
+        with open(config_path, "r") as f:
+            cfg = json.load(f)
+        if "Qwen3MHCForCausalLMV2" in cfg.get("architectures", []):
+            is_v2 = True
 
-    mhc_model, tokenizer = load_mhc_model(
-        mhc_model_path,
-        device=device,
-        torch_dtype=torch_dtype,
-        base_model=base_model,
-    )
+    if is_v2:
+        from src.conversionV2 import load_mhc_model_v2
+        mhc_model, tokenizer = load_mhc_model_v2(
+            mhc_model_path,
+            device=device,
+            torch_dtype=torch_dtype,
+            base_model=base_model,
+        )
+    else:
+        from src.conversion import load_mhc_model
+
+        mhc_model, tokenizer = load_mhc_model(
+            mhc_model_path,
+            device=device,
+            torch_dtype=torch_dtype,
+            base_model=base_model,
+        )
     mhc_model.eval()
 
     enc = tokenizer(
@@ -270,6 +331,30 @@ def main():
         )
 
     import matplotlib.pyplot as plt
+    
+    # Set better default style for publication-quality plots
+    plt.style.use('seaborn-v0_8-darkgrid' if 'seaborn-v0_8-darkgrid' in plt.style.available else 'default')
+    plt.rcParams['figure.facecolor'] = 'white'
+    plt.rcParams['axes.facecolor'] = '#f8f9fa'
+    plt.rcParams['axes.grid'] = True
+    plt.rcParams['axes.grid.axis'] = 'y'
+    plt.rcParams['axes.spines.left'] = True
+    plt.rcParams['axes.spines.bottom'] = True
+    plt.rcParams['axes.spines.top'] = True
+    plt.rcParams['axes.spines.right'] = True
+    plt.rcParams['axes.edgecolor'] = '#333333'
+    plt.rcParams['axes.linewidth'] = 1.2
+    plt.rcParams['grid.color'] = '#e0e0e0'
+    plt.rcParams['grid.linestyle'] = '-'
+    plt.rcParams['grid.linewidth'] = 0.8
+    plt.rcParams['grid.alpha'] = 0.5
+    plt.rcParams['font.size'] = 10
+    plt.rcParams['axes.labelsize'] = 11
+    plt.rcParams['axes.titlesize'] = 13
+    plt.rcParams['xtick.labelsize'] = 9
+    plt.rcParams['ytick.labelsize'] = 9
+    plt.rcParams['legend.fontsize'] = 10
+    plt.rcParams['lines.linewidth'] = 2.0
 
     # --- Training plots (loss gap + grad norm) ---
     std = None
@@ -285,17 +370,22 @@ def main():
         common_steps, std_loss, mhc_loss = _align_by_step(std, mhc)
         loss_gap = np.abs(mhc_loss - std_loss)
 
-        fig = plt.figure(figsize=(10, 5))
+        fig = plt.figure(figsize=(14, 6))
         ax1 = fig.add_subplot(1, 1, 1)
-        ax1.plot(common_steps, loss_gap, linewidth=1.5)
-        ax1.set_title("Absolute training loss gap")
-        ax1.set_xlabel("training step")
-        ax1.set_ylabel("|loss_mhc - loss_standard|")
-        ax1.grid(True, alpha=0.3)
+        ax1.plot(common_steps, loss_gap, linewidth=2.0, alpha=0.8)
+        ax1.fill_between(common_steps, loss_gap, alpha=0.2)
+        ax1.set_title("Absolute Training Loss Gap (mHC vs Standard)", fontweight='bold', fontsize=13)
+        ax1.set_xlabel("Training Step", fontweight='bold')
+        ax1.set_ylabel("|Loss_mHC - Loss_Standard|", fontweight='bold')
+        ax1.grid(True, alpha=0.5, linestyle='-', linewidth=0.8)
+        ax1.minorticks_on()
+        for spine in ax1.spines.values():
+            spine.set_edgecolor('#333333')
+            spine.set_linewidth(1.2)
 
         out_path = os.path.join(args.outdir, "training_loss_gap.png")
         fig.tight_layout()
-        fig.savefig(out_path, dpi=150)
+        fig.savefig(out_path, dpi=300, bbox_inches='tight')
         plt.close(fig)
         print(f"Saved: {out_path}")
     elif args.standard_log or args.mhc_log:
@@ -308,25 +398,30 @@ def main():
     if mhc is not None:
         loss_series = mhc.loss
         loss_steps = mhc.steps
-        loss_label = "mHC training loss"
+        loss_label = "mHC Training Loss"
     elif std is not None:
         loss_series = std.loss
         loss_steps = std.steps
-        loss_label = "standard training loss"
+        loss_label = "Standard Training Loss"
 
     if loss_series is not None:
-        fig = plt.figure(figsize=(10, 5))
+        fig = plt.figure(figsize=(14, 6))
         ax = fig.add_subplot(1, 1, 1)
-        ax.plot(loss_steps, loss_series, linewidth=1.5, label=loss_label, alpha=0.8)
-        ax.set_title("Training loss vs steps")
-        ax.set_xlabel("training step")
-        ax.set_ylabel("loss")
-        ax.grid(True, alpha=0.3)
-        ax.legend()
+        ax.plot(loss_steps, loss_series, linewidth=2.0, label=loss_label, alpha=0.85)
+        ax.fill_between(loss_steps, loss_series, alpha=0.15)
+        ax.set_title("Training Loss vs Training Steps", fontweight='bold', fontsize=13)
+        ax.set_xlabel("Training Step", fontweight='bold')
+        ax.set_ylabel("Loss", fontweight='bold')
+        ax.grid(True, alpha=0.5, linestyle='-', linewidth=0.8)
+        ax.minorticks_on()
+        for spine in ax.spines.values():
+            spine.set_edgecolor('#333333')
+            spine.set_linewidth(1.2)
+        ax.legend(loc='best', framealpha=0.95)
 
         out_path = os.path.join(args.outdir, "training_loss_curve.png")
         fig.tight_layout()
-        fig.savefig(out_path, dpi=150)
+        fig.savefig(out_path, dpi=300, bbox_inches='tight')
         plt.close(fig)
         print(f"Saved: {out_path}")
 
@@ -337,25 +432,30 @@ def main():
     if mhc is not None and mhc.grad_norm is not None:
         grad_series = mhc.grad_norm
         grad_steps = mhc.steps
-        label = "mHC grad_norm"
+        label = "mHC Gradient Norm"
     elif std is not None and std.grad_norm is not None:
         grad_series = std.grad_norm
         grad_steps = std.steps
-        label = "standard grad_norm"
+        label = "Standard Gradient Norm"
 
     if grad_series is not None:
-        fig = plt.figure(figsize=(10, 5))
+        fig = plt.figure(figsize=(14, 6))
         ax = fig.add_subplot(1, 1, 1)
-        ax.plot(grad_steps, grad_series, linewidth=1.5, label=label)
-        ax.set_title("Gradient norm vs steps")
-        ax.set_xlabel("training step")
-        ax.set_ylabel("grad_norm")
-        ax.grid(True, alpha=0.3)
-        ax.legend()
+        ax.plot(grad_steps, grad_series, linewidth=2.0, label=label, alpha=0.85)
+        ax.fill_between(grad_steps, grad_series, alpha=0.15)
+        ax.set_title("Gradient Norm vs Training Steps", fontweight='bold', fontsize=13)
+        ax.set_xlabel("Training Step", fontweight='bold')
+        ax.set_ylabel("Gradient Norm", fontweight='bold')
+        ax.grid(True, alpha=0.5, linestyle='-', linewidth=0.8)
+        ax.minorticks_on()
+        for spine in ax.spines.values():
+            spine.set_edgecolor('#333333')
+            spine.set_linewidth(1.2)
+        ax.legend(loc='best', framealpha=0.95)
 
         out_path = os.path.join(args.outdir, "training_grad_norm.png")
         fig.tight_layout()
-        fig.savefig(out_path, dpi=150)
+        fig.savefig(out_path, dpi=300, bbox_inches='tight')
         plt.close(fig)
         print(f"Saved: {out_path}")
     elif args.standard_log or args.mhc_log:
@@ -382,19 +482,25 @@ def main():
             max_length=args.max_length,
         )
 
-        fig = plt.figure(figsize=(10, 5))
+        fig = plt.figure(figsize=(14, 6))
         ax = fig.add_subplot(1, 1, 1)
-        ax.plot(mapping["layer_idx"], mapping["single_layer_gain"], marker="o", markersize=3, label="single-layer H_res gain")
-        ax.plot(mapping["layer_idx"], mapping["composite_gain"], marker="s", markersize=3, label="composite suffix gain")
-        ax.set_title("Amax Gain Magnitude vs unrolled layer index")
-        ax.set_xlabel("layer index l")
-        ax.set_ylabel("Amax Gain Magnitude")
-        ax.grid(True, alpha=0.3)
-        ax.legend()
+        ax.plot(mapping["layer_idx"], mapping["single_layer_gain"], marker="o", markersize=6, 
+                label="Single-Layer H_res Gain", linewidth=2.0, alpha=0.8)
+        ax.plot(mapping["layer_idx"], mapping["composite_gain"], marker="s", markersize=6, 
+                label="Composite Suffix Gain", linewidth=2.0, alpha=0.8)
+        ax.set_title("Amax Gain Magnitude vs Unrolled Layer Index", fontweight='bold', fontsize=13)
+        ax.set_xlabel("Unrolled Layer Index (Attn/FFN pairs)", fontweight='bold')
+        ax.set_ylabel("Amax Gain Magnitude", fontweight='bold')
+        ax.grid(True, alpha=0.5, linestyle='-', linewidth=0.8)
+        ax.minorticks_on()
+        for spine in ax.spines.values():
+            spine.set_edgecolor('#333333')
+            spine.set_linewidth(1.2)
+        ax.legend(loc='best', framealpha=0.95)
 
         out_path = os.path.join(args.outdir, "mapping_gain_vs_layer.png")
         fig.tight_layout()
-        fig.savefig(out_path, dpi=150)
+        fig.savefig(out_path, dpi=300, bbox_inches='tight')
         plt.close(fig)
         print(f"Saved: {out_path}")
     else:
