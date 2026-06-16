@@ -1,0 +1,9 @@
+subset,task,language,base_accuracy,base_classification,mhc_accuracy,mhc_classification,difference,winner
+copa.en,copa,English,0.56,fair,0.55,fair,-0.010000000000000009,base
+copa.gu,copa,Gujarati,0.5227272727272727,fair,0.5795454545454546,fair,0.05681818181818188,mhc
+copa.hi,copa,Hindi,0.5340909090909091,fair,0.6022727272727273,good,0.06818181818181823,mhc
+copa.mr,copa,Marathi,0.5,fair,0.5227272727272727,fair,0.022727272727272707,mhc
+wnli.en,wnli,English,0.0,very_poor,0.0,very_poor,0.0,tie
+wnli.gu,wnli,Gujarati,0.0,very_poor,0.0,very_poor,0.0,tie
+wnli.hi,wnli,Hindi,0.0,very_poor,0.0,very_poor,0.0,tie
+wnli.mr,wnli,Marathi,0.0,very_poor,0.0,very_poor,0.0,tie
