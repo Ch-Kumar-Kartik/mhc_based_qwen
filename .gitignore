@@ -38,3 +38,6 @@ train.out*
 bad_files*.json
 mhc_analysis.png
 plots/
+
+# Codex
+AGENTS.md
