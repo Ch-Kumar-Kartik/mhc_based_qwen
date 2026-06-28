@@ -638,7 +638,7 @@ def load_hf_dataset(
         dataloader_kwargs["prefetch_factor"] = prefetch_factor
         dataloader_kwargs["persistent_workers"] = persistent_workers
     
-    # Check if it's a pre-tokenized Arrow dataset (from download.py)
+    # Check if it is a pre-tokenized Arrow dataset from scripts/data.
     arrow_path = Path(data_path)
     if arrow_path.exists() and arrow_path.is_dir():
         # Check for Arrow dataset markers

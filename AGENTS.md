@@ -51,7 +51,7 @@ Top-level and script entrypoints:
   - CLI conversion to V2 model.
 - scripts/validate_equivalence.py
   - Validation CLI (tries V2 first, falls back to V1).
-- prepare_dataset.py, prepare_dataset_streaming.py, prepare_dataset_verified.py
+- scripts/data/prepare_dataset.py, scripts/data/prepare_dataset_streaming.py, scripts/data/prepare_dataset_verified.py
   - Dataset prep/tokenization/packing pipelines.
 
 ## Data Layout and Assumptions

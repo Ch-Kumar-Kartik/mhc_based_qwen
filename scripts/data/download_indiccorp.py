@@ -34,13 +34,13 @@ Supported languages (24 splits):
 
 Usage:
     # Download raw text (no tokenization) - works without PyTorch
-    python download_indiccorp.py --num_samples 10000 --raw
+    python -m scripts.data.download_indiccorp --num_samples 10000 --raw
     
     # Download specific languages
-    python download_indiccorp.py --languages hin_Deva ben_Beng tam_Taml --num_samples 10000 --raw
+    python -m scripts.data.download_indiccorp --languages hin_Deva ben_Beng tam_Taml --num_samples 10000 --raw
     
     # Download and tokenize (requires PyTorch + transformers)
-    python download_indiccorp.py --languages tel_Telu --num_samples 50000 --max_length 2048
+    python -m scripts.data.download_indiccorp --languages tel_Telu --num_samples 50000 --max_length 2048
 """
 
 import argparse
@@ -80,7 +80,7 @@ except ImportError:
 
 
 DEFAULT_MODEL = "Qwen/Qwen3-0.6B"
-DEFAULT_OUTPUT_DIR = Path(__file__).parent / "data" / "indiccorp"
+DEFAULT_OUTPUT_DIR = Path(__file__).resolve().parents[2] / "data" / "indiccorp"
 DEFAULT_MAX_LENGTH = 4096
 DEFAULT_TOKENIZE_BATCH_SIZE = 2000
 

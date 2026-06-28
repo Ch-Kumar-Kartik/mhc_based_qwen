@@ -10,7 +10,7 @@ Requirements implemented:
 - Save each split with `save_to_disk()` (Arrow, memory-mapped)
 
 Usage example:
-  python prepare_dataset.py --dataset ai4bharat/IndicCorpV2 \
+  python -m scripts.data.prepare_dataset --dataset ai4bharat/IndicCorpV2 \
       --tokenizer-model Qwen/Qwen3-0.6B \
       --output-dir C:/datasets/indiccorp_arrow --max-length 2048 --num-proc 16
 """

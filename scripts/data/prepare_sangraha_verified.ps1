@@ -1,3 +1,4 @@
+# Run from the repository root so relative data and script paths resolve.
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
@@ -400,8 +401,8 @@ if (Test-Path "prepare_data_storage_optimized.py") {
     $scriptName = "prepare_data_storage_optimized.py"
 } elseif (Test-Path "prepare_data_optimized.py") {
     $scriptName = "prepare_data_optimized.py"
-} elseif (Test-Path "prepare_sangraha_splits.py") {
-    $scriptName = "prepare_sangraha_splits.py"
+} elseif (Test-Path "scripts/data/prepare_sangraha_splits.py") {
+    $scriptName = "scripts/data/prepare_sangraha_splits.py"
 }
 
 if (-not $scriptName) {

@@ -98,7 +98,7 @@ class HFDataset(IterableDataset):
             msg = f"Dataset path does not exist: {dataset_path}"
             if available_datasets:
                 msg += f"\n  Available datasets in '{data_dir}': {available_datasets}"
-            msg += "\n  Run download_indiccorp.py first to create the dataset."
+            msg += "\n  Run python -m scripts.data.download_indiccorp first to create the dataset."
             logger.error(msg)
             raise FileNotFoundError(msg)
         
@@ -146,7 +146,10 @@ class HFDataset(IterableDataset):
             else:
                 # Original error handling
                 if not contents:
-                    msg = f"Dataset directory is empty: {dataset_path}\n  Run download_indiccorp.py to populate it."
+                    msg = (
+                        f"Dataset directory is empty: {dataset_path}\n"
+                        "  Run python -m scripts.data.download_indiccorp to populate it."
+                    )
                 elif not any(f.endswith('.arrow') or f == 'dataset_info.json' for f in contents):
                     msg = f"Directory is not a valid HuggingFace dataset: {dataset_path}\n  Contents: {contents}\n  Expected: .arrow files and dataset_info.json or language subdirectories"
                 else:

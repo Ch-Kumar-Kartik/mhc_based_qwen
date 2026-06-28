@@ -1,3 +1,5 @@
+"""Minimal Qwen3 to mHC V2 conversion example."""
+
 from src.conversionV2 import convert_qwen3_to_mhc_v2
 
 # Load original model and convert

@@ -15,13 +15,12 @@ import argparse
 from pathlib import Path
 import sys
 
-# Ensure project root is on sys.path so we can import prepare_dataset when running from scripts/
+# Support both `python -m scripts.generate_single_split` and direct execution.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from datasets import load_dataset, DatasetDict, Dataset
 
-# Import tokenize_and_pack from workspace prepare_dataset
-from prepare_dataset import tokenize_and_pack
+from scripts.data.prepare_dataset import tokenize_and_pack
 
 
 def main():

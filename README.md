@@ -5,7 +5,7 @@
 - **V2 is the recommended default**: The V2 implementation and conversion path are now the primary workflow for training and conversion.
 - **Conversion & validation CLIs**: Use `scripts/convert_to_mhc_v2.py` and `scripts/validate_equivalence.py` for warm-start conversion and equivalence checks.
 - **Config-driven training**: `scripts/train_v2.py` and the YAML configs in `configs/` are the preferred entrypoints for reproducible runs.
-- **Streaming dataset prep**: See `STREAMING_PREPARE.md` and the `prepare_dataset_*` scripts for streaming-friendly packing and verified shards.
+- **Dataset tooling**: Download, verification, tokenization, and packing utilities live in `scripts/data/`.
 - **Windows/offline notes**: Added platform guidance for Windows HDD I/O and offline model loading (see Platform-Specific Notes).
 - **Outputs & diagnostics**: Notable output folders (e.g. `output/qwen3_mhc_v2_converted`, `output/diagnostics/`) are used for converted checkpoints and evaluation artifacts.
 
@@ -39,9 +39,7 @@ mHC (Ours):            x_{l+1} = P_M(H_l^res) @ x_l + H_l^post.T @ F(H_l^pre @ x
 
 ## Analysis Results
 
-The following visualization shows the mHC parameter analysis after a **short 10-minute test training session**:
-
-![mHC Model Analysis](mhc_analysis.png)
+Analysis images are generated locally and intentionally excluded from version control.
 
 **Key observations from this minimal training run:**
 - **H_res matrices** remain close to identity (diagonal pattern visible in top heatmaps)
@@ -58,7 +56,20 @@ With longer training, we would expect:
 ## Documentation
 
 - **[SPEC.md](SPEC.md)** - Complete technical specification with all implementation details
+- **[FineWeb download guide](docs/fineweb-download.md)** - Dataset download and tokenization examples
 - This README - Quick overview and getting started guide
+
+## Repository Layout
+
+```text
+configs/       Training configurations
+docs/          Workflow documentation
+examples/      Minimal usage examples
+scripts/       Training, conversion, evaluation, and analysis CLIs
+scripts/data/  Dataset download and preparation utilities
+src/           mHC model, conversion, and stream-mixing implementation
+tests/         Unit and equivalence tests
+```
 
 ## Quick Start
 
@@ -235,7 +246,7 @@ This codebase provides both **V1 and V2** implementations of mHC:
 ### Training Scripts
 - **train.py** - Main training script with argparse interface
 - **scripts/train_v2.py** - Config-driven V2 trainer with step LR decay
-- **prepare_dataset.py**, **prepare_dataset_streaming.py**, **prepare_dataset_verified.py** - Dataset prep/tokenization/packing
+- **scripts/data/** - Dataset download, verification, tokenization, and packing
 
 ## Data Layout and Assumptions
 

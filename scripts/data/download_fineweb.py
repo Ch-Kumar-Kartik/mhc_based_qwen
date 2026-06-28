@@ -5,8 +5,8 @@ This script downloads raw text from HuggingFace and tokenizes it for
 use with Qwen3-based mHC models.
 
 Usage:
-    python download.py --num_samples 100000 --output_dir ./data
-    python download.py --num_samples 10000 --shard_size 5000 --output_dir ./data
+    python -m scripts.data.download_fineweb --num_samples 100000 --output_dir ./data
+    python -m scripts.data.download_fineweb --num_samples 10000 --shard_size 5000 --output_dir ./data
 
 Dataset: https://huggingface.co/datasets/HuggingFaceFW/fineweb-edu
 """
@@ -23,7 +23,7 @@ from tqdm import tqdm
 
 DEFAULT_MODEL = "Qwen/Qwen3-0.6B"
 DEFAULT_SUBSET = "sample-10BT"  # Smaller subset: ~10B tokens
-DEFAULT_OUTPUT_DIR = Path(__file__).parent / "data"
+DEFAULT_OUTPUT_DIR = Path(__file__).resolve().parents[2] / "data"
 DEFAULT_MAX_LENGTH = 4096
 
 

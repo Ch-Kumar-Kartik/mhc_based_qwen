@@ -343,7 +343,7 @@ def load_hf_dataset(
     logger = logging.getLogger(__name__)
     logger.info(f"Loading dataset: {data_path}")
     
-    # Check if it's a pre-tokenized Arrow dataset (from download.py)
+    # Check if it is a pre-tokenized Arrow dataset from scripts/data.
     arrow_path = Path(data_path)
     if arrow_path.exists() and arrow_path.is_dir():
         # Check for Arrow dataset markers
